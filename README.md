@@ -50,7 +50,8 @@ FlowBot 平台适配器：通过 **FlowBot Docker WebUI 统一端口**连接微�
 - URL 源且 `flowbot_use_direct_url=true` → 直接透传 `image_url`（省流量），同时预下载一份本地缓存；若透传失败且有本地文件，自动回退以 `image_base64` 重发
 - URL 源默认（透传关闭）→ 下载后以 `image_base64` 发送
 - 文件超过 `flowbot_image_size_threshold`（MB，默认 10）→ 有 URL 则透传 URL；无 URL 则调用 `POST /api/v1/media/upload`（JSON `{"image_base64": ...}`）拿 `image_token`
-- 图片下载超时 15s，失败记日志并跳过
+- 图片下载超时 15s，上限 20MB，失败记日志并跳过
+- WebSocket 心跳保活 30s，及时检测断线
 - FlowBot body 上限 20MB（base64 约承载 15MB 原图）
 
 ## 注意事项
@@ -72,4 +73,3 @@ python -m py_compile main.py
 
 - 定期拉取 `/api/v1/sessions` 建立 昵称 → wxid 映射缓存，用于更友好的群成员展示
 - 对接 OneBot v11 协议（FlowBot 自带），作为容错第二通道
-- WebSocket 心跳保活（当前依赖服务端 ping/连接空闲规则）

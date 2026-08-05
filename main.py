@@ -46,6 +46,8 @@ _DEFAULT_RECONNECT = 5
 _DEFAULT_MAX_RECONNECT_ATTEMPTS = 5
 _DEDUP_WINDOW = 600
 _RECENT_SEND_TTL = 3
+_MAX_DOWNLOAD_BYTES = 20 * 1024 * 1024  # 单次图片下载大小上限 20MB
+_WS_PING_INTERVAL = 30  # WebSocket 心跳间隔（秒），用于检测半开连接
 
 
 @register_platform_adapter(
@@ -135,6 +137,7 @@ class FlowBotPlatform(Platform):
         self._seen_ids: dict[str, float] = {}
         self._recent_sends: deque[tuple[str, str, float]] = deque(maxlen=50)
         self._sessions_cache: dict[str, dict] = {}
+        self._temp_files: set[str] = set()
         self._stats = {"recv": 0, "sent": 0}
 
     # ── 基础 ──────────────────────────────────────────────────────────
@@ -171,6 +174,7 @@ class FlowBotPlatform(Platform):
         if self._http is not None:
             await self._http.close()
             self._http = None
+        self._cleanup_temp_files()
         logger.info("FlowBot adapter 已终止")
 
     def get_stats(self) -> dict:
@@ -239,9 +243,11 @@ class FlowBotPlatform(Platform):
         attempts = 0
         while not self._stop_event.is_set():
             try:
-                async with ws_connect(self._ws_url, ping_interval=None) as ws:
+                async with ws_connect(
+                    self._ws_url, ping_interval=_WS_PING_INTERVAL
+                ) as ws:
                     logger.info(
-                        f"FlowBot WS 已连接: ws://{_redact_host(self._webui_base)}/api/v1/ws/messages"
+                        f"FlowBot WS 已连接: ws://{_mask_host(self._webui_base)}/api/v1/ws/messages"
                     )
                     attempts = 0  # 连接成功，重置连续失败计数
                     delay = max(
@@ -265,7 +271,7 @@ class FlowBotPlatform(Platform):
             if max_attempts > 0 and attempts > max_attempts:
                 logger.error(
                     f"FlowBot WS 连续断线重连超过 {max_attempts} 次，停止重连。"
-                    f"请检查 FlowBot 服务（{_redact_host(self._webui_base)}）与配置"
+                    f"请检查 FlowBot 服务（{_mask_host(self._webui_base)}）与配置"
                 )
                 break
             logger.info(f"FlowBot WS 第 {attempts} 次重连，{delay}s 后重试...")
@@ -377,6 +383,16 @@ class FlowBotPlatform(Platform):
             session_id=message.session_id,
             platform=self,
         )
+        # 入站：将本适配器下载的临时图片登记到事件周期，事件结束后由 AstrBot 清理
+        for comp in message.message or []:
+            if isinstance(comp, Image):
+                file_ref = getattr(comp, "file", None)
+                if file_ref and file_ref in self._temp_files:
+                    try:
+                        event.track_temporary_local_file(file_ref)
+                        self._forget_temp_file(file_ref)
+                    except Exception as e:
+                        logger.debug(f"FlowBot 临时图片登记失败: {e}")
         self.commit_event(event)
 
     def _fix_image_url(self, url: str) -> str:
@@ -392,7 +408,7 @@ class FlowBotPlatform(Platform):
         return url
 
     async def _download_image(self, url: str) -> str | None:
-        """下载图片到临时文件，返回本地路径。超时 15s。"""
+        """下载图片到临时文件，返回本地路径。超时 15s，大小上限 20MB。"""
         if not url:
             return None
         http = await self._ensure_http()
@@ -402,15 +418,46 @@ class FlowBotPlatform(Platform):
                 if resp.status != 200:
                     logger.warning(f"图片下载失败 {resp.status}: {url[:120]}")
                     return None
-                data = await resp.read()
+                chunks: list[bytes] = []
+                total = 0
+                async for chunk in resp.content.iter_chunked(64 * 1024):
+                    total += len(chunk)
+                    if total > _MAX_DOWNLOAD_BYTES:
+                        logger.warning(
+                            f"图片下载超过大小上限 {_MAX_DOWNLOAD_BYTES}: {url[:120]}"
+                        )
+                        return None
+                    chunks.append(chunk)
                 suffix = _guess_suffix(url)
                 fd, path = tempfile.mkstemp(suffix=suffix)
                 with os.fdopen(fd, "wb") as f:
-                    f.write(data)
+                    for chunk in chunks:
+                        f.write(chunk)
+                self._track_temp_file(path)
                 return path
         except (aiohttp.ClientError, asyncio.TimeoutError) as e:
             logger.warning(f"图片下载异常: {e}")
             return None
+
+    def _track_temp_file(self, path: str):
+        """登记本适配器创建的临时文件，用于后续统一清理。"""
+        if path:
+            self._temp_files.add(path)
+
+    def _forget_temp_file(self, path: str):
+        """解除临时文件登记（配合 track_temporary_local_file 由 AstrBot 清理）。"""
+        if path:
+            self._temp_files.discard(path)
+
+    def _cleanup_temp_files(self):
+        """删除本适配器创建且仍未被使用/登记的临时文件。"""
+        for path in list(self._temp_files):
+            try:
+                if os.path.isfile(path):
+                    os.remove(path)
+            except OSError:
+                pass
+        self._temp_files.clear()
 
     # ── 出站：发送 ─────────────────────────────────────────────────────
 
@@ -531,6 +578,7 @@ class FlowBotPlatform(Platform):
                 break
 
         local_path = ""
+        downloaded_path = ""
         for candidate in (raw, url, comp_path):
             if candidate and os.path.isfile(candidate):
                 local_path = candidate
@@ -538,81 +586,97 @@ class FlowBotPlatform(Platform):
         if not local_path and direct_url:
             # 无论是否透传 URL，都先下载一份本地缓存，供 image_url 发送失败时回退 base64
             local_path = await self._download_image(direct_url)
+            if local_path:
+                downloaded_path = local_path
             if use_direct_url and not local_path:
                 logger.debug("FlowBot 图片兜底下载失败，继续透传 URL")
 
-        if use_direct_url and direct_url:
-            payload["image_url"] = direct_url
-        elif local_path:
-            size = os.path.getsize(local_path)
-            if size > threshold_bytes and direct_url:
+        try:
+            if use_direct_url and direct_url:
                 payload["image_url"] = direct_url
-            elif size > threshold_bytes:
-                token = await self._upload_media(local_path=local_path)
-                if token:
-                    payload["image_token"] = token
+            elif local_path:
+                size = os.path.getsize(local_path)
+                if size > threshold_bytes and direct_url:
+                    payload["image_url"] = direct_url
+                elif size > threshold_bytes:
+                    token = await self._upload_media(local_path=local_path)
+                    if token:
+                        payload["image_token"] = token
+                    else:
+                        logger.warning(
+                            f"FlowBot 图片 {size} 字节超过阈值 {threshold_bytes}，"
+                            f"且无 URL 可透传、上传失败，已跳过"
+                        )
+                        return
                 else:
+                    try:
+                        with open(local_path, "rb") as f:
+                            payload["image_base64"] = base64.b64encode(f.read()).decode(
+                                "ascii"
+                            )
+                    except Exception as e:
+                        logger.warning(f"FlowBot 图片 base64 读取失败: {e}")
+                        return
+                    payload["image_path"] = local_path  # 同主机部署兼容
+            else:
+                # 兜底：走 AstrBot 官方归一化（统一处理 base64:// file:/// http 纯路径）
+                try:
+                    logger.debug(
+                        f"FlowBot 图片字段 file={raw[:40]!r} url={url[:40]!r} "
+                        f"path={comp_path[:40]!r}，尝试 convert_to_base64"
+                    )
+                    b64_source = await comp.convert_to_base64()
+                except Exception as e:
                     logger.warning(
-                        f"FlowBot 图片 {size} 字节超过阈值 {threshold_bytes}，"
-                        f"且无 URL 可透传、上传失败，已跳过"
+                        f"FlowBot 图片发送失败: 无可用图片源 (session={session_id}): {e}"
                     )
                     return
-            else:
+                if b64_source:
+                    payload["image_base64"] = b64_source.strip()
+                    result = await self._api_json(
+                        "POST", "/api/v1/messages/send", payload
+                    )
+                    if result is not None:
+                        self._stats["sent"] += 1
+                        logger.info(f"FlowBot image(convert) -> {session_id}")
+                    return
+
+            result = await self._api_json("POST", "/api/v1/messages/send", payload)
+            # image_url 透传失败（如 URL 不可达）时，若本地有文件则回退以 base64 重发
+            if (
+                result is None
+                and "image_url" in payload
+                and local_path
+                and os.path.isfile(local_path)
+            ):
+                logger.warning(
+                    f"FlowBot image_url 发送失败，回退 image_base64: {session_id}"
+                )
+                retry: dict = {"session_id": session_id, "type": "image"}
+                if reply_to:
+                    retry["reply_to"] = reply_to
                 try:
                     with open(local_path, "rb") as f:
-                        payload["image_base64"] = base64.b64encode(f.read()).decode(
+                        retry["image_base64"] = base64.b64encode(f.read()).decode(
                             "ascii"
                         )
                 except Exception as e:
-                    logger.warning(f"FlowBot 图片 base64 读取失败: {e}")
+                    logger.warning(f"FlowBot 图片 base64 回退读取失败: {e}")
                     return
-                payload["image_path"] = local_path  # 同主机部署兼容
-        else:
-            # 兜底：走 AstrBot 官方归一化（统一处理 base64:// file:/// http 纯路径）
-            try:
-                logger.debug(
-                    f"FlowBot 图片字段 file={raw[:40]!r} url={url[:40]!r} "
-                    f"path={comp_path[:40]!r}，尝试 convert_to_base64"
-                )
-                b64_source = await comp.convert_to_base64()
-            except Exception as e:
-                logger.warning(
-                    f"FlowBot 图片发送失败: 无可用图片源 (session={session_id}): {e}"
-                )
-                return
-            if b64_source:
-                payload["image_base64"] = b64_source.strip()
-                result = await self._api_json(
-                    "POST", "/api/v1/messages/send", payload
-                )
-                if result is not None:
-                    self._stats["sent"] += 1
-                    logger.info(f"FlowBot image(convert) -> {session_id}")
-                return
-
-        result = await self._api_json("POST", "/api/v1/messages/send", payload)
-        # image_url 透传失败（如 URL 不可达）时，若本地有文件则回退以 base64 重发
-        if (
-            result is None
-            and "image_url" in payload
-            and local_path
-            and os.path.isfile(local_path)
-        ):
-            logger.warning(f"FlowBot image_url 发送失败，回退 image_base64: {session_id}")
-            retry: dict = {"session_id": session_id, "type": "image"}
-            if reply_to:
-                retry["reply_to"] = reply_to
-            try:
-                with open(local_path, "rb") as f:
-                    retry["image_base64"] = base64.b64encode(f.read()).decode("ascii")
-            except Exception as e:
-                logger.warning(f"FlowBot 图片 base64 回退读取失败: {e}")
-                return
-            retry["image_path"] = local_path
-            result = await self._api_json("POST", "/api/v1/messages/send", retry)
-        if result is not None:
-            self._stats["sent"] += 1
-            logger.info(f"FlowBot image -> {session_id}")
+                retry["image_path"] = local_path
+                result = await self._api_json("POST", "/api/v1/messages/send", retry)
+            if result is not None:
+                self._stats["sent"] += 1
+                logger.info(f"FlowBot image -> {session_id}")
+        finally:
+            # 随用随清：删除本次下载的临时缓存文件
+            if downloaded_path:
+                try:
+                    if os.path.isfile(downloaded_path):
+                        os.remove(downloaded_path)
+                except OSError:
+                    pass
+                self._forget_temp_file(downloaded_path)
 
     async def _upload_media(
         self, local_path: str | None = None, b64: str | None = None
@@ -730,6 +794,15 @@ def _guess_suffix(url: str) -> str:
     return ".jpg"
 
 
-def _redact_host(base: str) -> str:
-    """隐藏日志中的 host（不泄露内网地址细节）。"""
-    return base.replace("http://", "").replace("https://", "")
+def _mask_host(base: str) -> str:
+    """隐藏日志中的 host 细节：去掉协议前缀并打码主机部分，仅保留端口示意。"""
+    cleaned = base.replace("http://", "").replace("https://", "")
+    if ":" in cleaned:
+        host, port = cleaned.rsplit(":", 1)
+        if host:
+            first = host.split(".")[0]
+            masked = f"{first}.***"
+        else:
+            masked = "***"
+        return f"{masked}:{port}"
+    return cleaned

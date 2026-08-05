@@ -2,6 +2,16 @@
 
 本插件所有版本更新记录。版本遵循语义化版本（`vMAJOR.MINOR.PATCH`）。
 
+## v1.0.10 — 2026-08-05
+
+### 修复
+- **临时文件泄漏**：`_download_image` 创建的临时文件现纳入 `_temp_files` 追踪集合；出站下载的缓存文件随用随清（try/finally），入站下载的临时图片登记到事件（`track_temporary_local_file`）由 AstrBot 清理，`terminate()` 兜底清除全部残留
+- **下载无大小限制**：图片下载改为分块读取并限制 20MB 上限，防止恶意 URL 导致 OOM
+
+### 变更
+- **WebSocket 心跳**：`ping_interval` 由禁用改为 30s，及时检测半开连接
+- **`_redact_host` 更名 `_mask_host`**：原来只剥协议前缀，现真正对主机名打码（如 `host.***:port`），避免日志泄露内网地址
+
 ## v1.0.9 — 2026-08-05
 
 ### 修复
