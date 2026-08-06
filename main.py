@@ -30,9 +30,18 @@ if aiohttp is None or ws_connect is None:
 
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent, MessageChain
-from astrbot.api.message_components import At, Image, Plain, Reply
+from astrbot.api.message_components import (
+    At,
+    AtAll,
+    BaseMessageComponent,
+    ComponentType,
+    Image,
+    Plain,
+    Reply,
+)
 from astrbot.api.platform import (
     AstrBotMessage,
+    Group,
     MessageMember,
     MessageType,
     Platform,
@@ -137,8 +146,20 @@ class FlowBotPlatform(Platform):
         self._seen_ids: dict[str, float] = {}
         self._recent_sends: deque[tuple[str, str, float]] = deque(maxlen=50)
         self._sessions_cache: dict[str, dict] = {}
+        self._MAX_SESSIONS_CACHE = 2000
         self._temp_files: set[str] = set()
         self._stats = {"recv": 0, "sent": 0}
+
+    def _cache_session(self, session_id: str, item: dict):
+        """写入会话缓存，超出容量时清理最旧条目，防止无限增长。"""
+        if not session_id:
+            return
+        self._sessions_cache[session_id] = item
+        if len(self._sessions_cache) > self._MAX_SESSIONS_CACHE:
+            for k in list(self._sessions_cache)[
+                : len(self._sessions_cache) - self._MAX_SESSIONS_CACHE
+            ]:
+                self._sessions_cache.pop(k, None)
 
     # ── 基础 ──────────────────────────────────────────────────────────
 
@@ -225,21 +246,20 @@ class FlowBotPlatform(Platform):
 
     # ── 入站：WebSocket 消费 ──────────────────────────────────────────
 
+    def _config_int(self, key: str, default: int) -> int:
+        """安全读取 int 配置，非法值回退默认。"""
+        try:
+            return int(self.config.get(key, default) or default)
+        except (TypeError, ValueError):
+            return default
+
     async def _run_ws_loop(self):
         delay = max(
-            1,
-            int(
-                self.config.get("flowbot_reconnect_interval", _DEFAULT_RECONNECT)
-                or _DEFAULT_RECONNECT
-            ),
+            1, self._config_int("flowbot_reconnect_interval", _DEFAULT_RECONNECT)
         )
-        try:
-            max_attempts = int(
-                self.config.get("flowbot_reconnect_max_attempts", _DEFAULT_MAX_RECONNECT_ATTEMPTS)
-                or _DEFAULT_MAX_RECONNECT_ATTEMPTS
-            )
-        except (TypeError, ValueError):
-            max_attempts = _DEFAULT_MAX_RECONNECT_ATTEMPTS
+        max_attempts = self._config_int(
+            "flowbot_reconnect_max_attempts", _DEFAULT_MAX_RECONNECT_ATTEMPTS
+        )
         attempts = 0
         while not self._stop_event.is_set():
             try:
@@ -252,9 +272,8 @@ class FlowBotPlatform(Platform):
                     attempts = 0  # 连接成功，重置连续失败计数
                     delay = max(
                         1,
-                        int(
-                            self.config.get("flowbot_reconnect_interval", _DEFAULT_RECONNECT)
-                            or _DEFAULT_RECONNECT
+                        self._config_int(
+                            "flowbot_reconnect_interval", _DEFAULT_RECONNECT
                         ),
                     )
                     async for raw in ws:
@@ -309,7 +328,7 @@ class FlowBotPlatform(Platform):
         if self._is_recent_send(session_id, data.get("content", "")):
             return
 
-        self._sessions_cache[session_id] = data
+        self._cache_session(session_id, data)
         try:
             abm = await self.convert_message(data)
         except Exception as e:
@@ -346,11 +365,20 @@ class FlowBotPlatform(Platform):
             nickname=str(data.get("sender_name") or "")
             or str(data.get("sender_id") or ""),
         )
+        # 机器人自身 wxid（flowbot 推送新增 self_id，供 AstrBot 识别"@登录账号"）
+        abm.self_id = str(data.get("self_id") or "")
+        if is_group:
+            # 为群消息设置群信息，避免 AstrBot 群上下文错误（回退到 sender.group_id）
+            abm.group = Group(
+                group_id=abm.session_id,
+                group_name=str(data.get("group_name") or ""),
+            )
         abm.raw_message = data
 
         mtype = str(data.get("type") or "text")
         text = str(data.get("content") or "")
         abm.message_str = text
+
         components = []
         if mtype == "image":
             url = data.get("image_url") or (text if text.startswith("http") else "")
@@ -372,6 +400,21 @@ class FlowBotPlatform(Platform):
             )
         else:
             components.append(Plain(text=text))
+
+        # @ 唤醒：群里 @ 到机器人（flowbot 从消息 XML atuserlist 提取 at_users），
+        # 生成 At 组件 → AstrBot 唤醒条件 At.qq == get_self_id() 命中
+        at_users = data.get("at_users") or []
+        if is_group and abm.self_id:
+            at_targets = [str(x) for x in at_users]
+            is_at_all = any(str(x).lower() in ("notify@all", "all") for x in at_targets)
+            is_self_at = abm.self_id in at_targets
+            if is_at_all:
+                components.insert(0, AtAll())
+            elif is_self_at:
+                components.insert(
+                    0,
+                    At(qq=abm.self_id, name=str(data.get("group_name") or "")),
+                )
         abm.message = components
         return abm
 
@@ -408,33 +451,36 @@ class FlowBotPlatform(Platform):
         return url
 
     async def _download_image(self, url: str) -> str | None:
-        """下载图片到临时文件，返回本地路径。超时 15s，大小上限 20MB。"""
+        """下载图片到临时文件，返回本地路径。超时 15s，大小上限 20MB。
+
+        使用独立的无鉴权 session，避免把 FlowBot API Key 随下载请求泄露给第三方 URL。
+        """
         if not url:
             return None
-        http = await self._ensure_http()
         try:
             timeout = aiohttp.ClientTimeout(total=15)
-            async with http.get(url, timeout=timeout) as resp:
-                if resp.status != 200:
-                    logger.warning(f"图片下载失败 {resp.status}: {url[:120]}")
-                    return None
-                chunks: list[bytes] = []
-                total = 0
-                async for chunk in resp.content.iter_chunked(64 * 1024):
-                    total += len(chunk)
-                    if total > _MAX_DOWNLOAD_BYTES:
-                        logger.warning(
-                            f"图片下载超过大小上限 {_MAX_DOWNLOAD_BYTES}: {url[:120]}"
-                        )
+            async with aiohttp.ClientSession(timeout=timeout) as sess:
+                async with sess.get(url) as resp:
+                    if resp.status != 200:
+                        logger.warning(f"图片下载失败 {resp.status}: {url[:120]}")
                         return None
-                    chunks.append(chunk)
-                suffix = _guess_suffix(url)
-                fd, path = tempfile.mkstemp(suffix=suffix)
-                with os.fdopen(fd, "wb") as f:
-                    for chunk in chunks:
-                        f.write(chunk)
-                self._track_temp_file(path)
-                return path
+                    chunks: list[bytes] = []
+                    total = 0
+                    async for chunk in resp.content.iter_chunked(64 * 1024):
+                        total += len(chunk)
+                        if total > _MAX_DOWNLOAD_BYTES:
+                            logger.warning(
+                                f"图片下载超过大小上限 {_MAX_DOWNLOAD_BYTES}: {url[:120]}"
+                            )
+                            return None
+                        chunks.append(chunk)
+                    suffix = _guess_suffix(url)
+                    fd, path = tempfile.mkstemp(suffix=suffix)
+                    with os.fdopen(fd, "wb") as f:
+                        for chunk in chunks:
+                            f.write(chunk)
+                    self._track_temp_file(path)
+                    return path
         except (aiohttp.ClientError, asyncio.TimeoutError) as e:
             logger.warning(f"图片下载异常: {e}")
             return None
@@ -474,17 +520,38 @@ class FlowBotPlatform(Platform):
         for comp in message_chain.chain:
             if isinstance(comp, Plain):
                 text_parts.append(comp.text)
+            elif isinstance(comp, FlowBotMention):
+                # 自研 wxid 组件：直接取 wxid（"all" = @全体）
+                target = str(getattr(comp, "wxid", None) or "")
+                if target == "all":
+                    at_users.append("all")
+                elif target:
+                    at_users.append(target)
             elif isinstance(comp, At):
-                at_users.append(comp.uid)
+                # 兼容 AstrBot 内置 At（含第三方插件）：wxid → qq → uid
+                target = str(
+                    getattr(comp, "wxid", None)
+                    or getattr(comp, "qq", None)
+                    or getattr(comp, "uid", None)
+                    or ""
+                )
+                if target == "all":
+                    at_users.append("all")
+                elif target:
+                    at_users.append(target)
             elif isinstance(comp, Reply):
                 reply_to = str(comp.id or "")
             elif isinstance(comp, Image):
                 images.append(comp)
 
-        if text_parts or at_users:
-            text = "".join(text_parts)
+        text = "".join(text_parts).strip()
+        if text:
+            # 有正文 → 携带 at_users 发送（flowbot 端渲染真实 @）
             await self._send_text(session_id, text, at_users, reply_to)
             self._mark_sent(session_id, text)
+        elif at_users and not images:
+            # 纯 @ 无正文：无内容可发，跳过（避免 flowbot 400 Missing content）
+            logger.debug(f"FlowBot 跳过空正文 @ 消息 (session={session_id})")
         for img in images:
             await self._send_image(session_id, img, reply_to)
             self._mark_sent(session_id, "")
@@ -703,9 +770,7 @@ class FlowBotPlatform(Platform):
             async with http.post(url, json=payload) as resp:
                 text = await resp.text()
                 if resp.status >= 400:
-                    logger.warning(
-                        f"FlowBot 媒体上传失败 {resp.status}: {text[:200]}"
-                    )
+                    logger.warning(f"FlowBot 媒体上传失败 {resp.status}: {text[:200]}")
                     return None
                 result = await _parse_json(text)
                 if isinstance(result, dict):
@@ -738,12 +803,30 @@ class FlowBotPlatform(Platform):
                     if isinstance(item, dict):
                         sid = item.get("session_id") or item.get("id")
                         if sid:
-                            self._sessions_cache[str(sid)] = item
+                            self._cache_session(str(sid), item)
                 if items:
                     logger.info(f"FlowBot 会话预载完成: {len(items)} 个会话")
             except Exception as e:
                 logger.debug(f"FlowBot 会话预载失败: {e}")
             await asyncio.sleep(300)
+
+
+class FlowBotMention(BaseMessageComponent):
+    """FlowBot 自研 @ 组件：wxid 语义，不依赖 OneBot 的 qq 字段。
+
+    type 复用 At 以兼容 AstrBot 序列化；toDict 把 wxid 映射进 qq 位置，
+    保证 AstrBot 内部重建 At(qq=...) 不报错。
+    """
+
+    type: ComponentType = ComponentType.At
+    wxid: str = ""
+    name: str | None = ""
+
+    def __init__(self, wxid: str = "", name: str = "", **_) -> None:
+        super().__init__(wxid=wxid, name=name)
+
+    def toDict(self):
+        return {"type": "at", "data": {"qq": str(self.wxid)}}
 
 
 class FlowBotMessageEvent(AstrMessageEvent):
@@ -761,7 +844,9 @@ class FlowBotMessageEvent(AstrMessageEvent):
         self._platform = platform
 
     async def send(self, message: MessageChain):
-        await self._platform._send_to_session(self.get_sender_id(), message)
+        # 群消息回复目标应为群会话（get_session_id），而非发送者本人（get_sender_id）
+        target = self.get_session_id() or self.get_sender_id()
+        await self._platform._send_to_session(target, message)
         await super().send(message)
 
 

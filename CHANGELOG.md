@@ -2,6 +2,73 @@
 
 本插件所有版本更新记录。版本遵循语义化版本（`vMAJOR.MINOR.PATCH`）。
 
+## v1.1.0 — 2026-08-07
+
+### 变更
+- **ruff 格式优化**：对 main.py 执行 `ruff format`，解决 23 处超长行（E501），纯格式重排，无逻辑变更；`ruff check` 全部通过
+
+## v1.0.19 — 2026-08-07
+
+### 修复
+- **会话缓存无限增长**：`_sessions_cache` 新增容量上限（2000 条），超限时清理最旧条目，统一经 `_cache_session` 写入（入站消息与会话预载两处），防止长期运行内存缓慢增长
+
+## v1.0.18 — 2026-08-07
+
+### 变更
+- **移除 v1.0.16 临时调试日志**：`FlowBot 入站` 日志使命完成（已定位 flowbot 侧 at_users 缺失并修复），不再输出，减少日志噪音
+
+## v1.0.17 — 2026-08-07
+
+### 修复
+- **入站消息全部转换失败（UnboundLocalError）**：v1.0.16 新增的调试日志在 `text` 赋值前引用该局部变量，Python 作用域规则导致所有入站消息抛 `cannot access local variable 'text'`。将 `text`/`mtype` 赋值提前到日志语句之前
+- **API Key 随图片下载泄漏**：`_download_image` 此前复用带 `Authorization: Bearer` 的共享 session，向第三方 URL 下载图片时会泄露 FlowBot API Key。改用独立的无鉴权 `aiohttp.ClientSession`
+- **WS 重连配置读取无异常保护**：`delay` 的 `int()` 转换未包 try/except，配置填非法值会导致 WS 循环启动即崩溃。新增 `_config_int` 辅助方法统一安全读取
+
+## v1.0.16 — 2026-08-06
+
+### 变更
+- `convert_message` 增加入站调试日志（self_id / at_users / type / content）
+
+## v1.0.15 — 2026-08-06
+
+### 新增
+- **@ 唤醒支持**：`convert_message` 读取 flowbot 推送的 `self_id` 与 `at_users`（flowbot 从消息 XML `atuserlist` 提取），为群消息生成 At 组件实现唤醒：
+  - `notify@all`/`all` → `AtAll()`（AstrBot 唤醒条件 3）
+  - 命中 `self_id` → `At(qq=self_id, name=group_name)`（唤醒条件 2，`At.qq == get_self_id()`）
+  - 组件插入消息链首位，回复带 @ 更自然
+- 导入 `AtAll`（`astrbot.api.message_components` 通配导出）
+
+## v1.0.14 — 2026-08-06
+
+### 修复
+- **群消息缺失 group 信息**：`convert_message` 为群消息设置 `abm.group = Group(group_id=session_id, group_name=...)`，避免 AstrBot 群上下文错误（`AstrBotMessage.group_id` 回退到 sender 导致 self_learning 等日志群 id 显示为发送者）
+
+### 变更
+- 导入 `Group`（来自 `astrbot.api.platform`，核心导出）
+
+## v1.0.13 — 2026-08-06
+
+### 新增
+- **FlowBotMention 自研 @ 组件**：wxid 语义，type 复用 `ComponentType.At` 兼容 AstrBot 序列化，`toDict()` 把 wxid 映射进 qq 位置。自有插件可用 `FlowBotMention(wxid="k22236", name="Unsuited.")` 构造真正的 wxid @
+
+### 修复
+- **群回复目标修正**：`FlowBotMessageEvent.send()` 改用 `get_session_id() or get_sender_id()`，群消息回复发往群会话而非发送者本人
+- **空正文 @ 跳过**：纯 @（无正文无图片）不再发送，避免 flowbot 400 Missing content
+
+### 变更
+- `_send_to_session` 识别 `FlowBotMention`（wxid 直取）与内置 `At`（wxid → qq → uid 兼容），`qq == "all"` 识别为 @全体
+
+## v1.0.12 — 2026-08-06
+
+### 变更
+- **@ 目标读取优先级调整为 wxid → qq → uid**：FlowBot/微信的 @ 目标本质是 `wxid`，AstrBot 的 `At` 组件字段名沿用 OneBot v11 的 `qq`。读取顺序改为优先取 `wxid`（若未来组件携带该字段），其次 `qq`，再兜底旧版 `uid`；`qq == "all"` 识别为 @全体
+- 注：AstrBot `At` 组件本身只有 `qq`/`name` 字段，无法直接构造 `At(wxid=...)`，本改动是在适配器读取侧做语义对齐
+
+## v1.0.11 — 2026-08-06
+
+### 修复
+- **`At` 组件字段错误导致发送崩溃**：`_send_to_session` 使用 `comp.uid` 读取 @ 目标，但 AstrBot 当前版本的 `At` 组件字段为 `qq`（`name` 为昵称）。改用 `getattr(comp, "qq")` 并兼容旧版 `uid` 兜底。此前切换模型等命令生成 `[At, Plain]` 回复链时，适配器在 `main.py:478` 抛 `AttributeError: 'At' object has no attribute 'uid'`，导致整条消息发送失败
+
 ## v1.0.10 — 2026-08-05
 
 ### 修复

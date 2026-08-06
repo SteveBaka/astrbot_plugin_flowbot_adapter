@@ -38,8 +38,8 @@ FlowBot 平台适配器：通过 **FlowBot Docker WebUI 统一端口**连接微�
 ## 消息能力
 
 - 文本、图片收发
-- 群聊 / 私聊（会话类型判断）
-- 群 @ 发送（`at_users`）
+- 群聊 / 私聊（会话类型判断，群回复目标为群会话）
+- 群 @ 发送（`at_users`，支持 `FlowBotMention(wxid=...)` 自研组件与 AstrBot 内置 `At(qq=...)` 兼容；`"all"` = @全体）
 - 回复消息（`reply_to`，需对端支持）
 
 ## 图片发送策略
