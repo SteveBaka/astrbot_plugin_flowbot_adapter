@@ -71,5 +71,4 @@ python -m py_compile main.py
 
 ## 后续规划（可选）
 
-- 定期拉取 `/api/v1/sessions` 建立 昵称 → wxid 映射缓存，用于更友好的群成员展示
 - 对接 OneBot v11 协议（FlowBot 自带），作为容错第二通道

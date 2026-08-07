@@ -2,6 +2,21 @@
 
 本插件所有版本更新记录。版本遵循语义化版本（`vMAJOR.MINOR.PATCH`）。
 
+## v1.1.2 — 2026-08-07
+
+### 变更
+- **完整适配 AstrBot Platform 标准接口**：补全第三方插件按标准发现/操作本适配器所需的能力
+  - 新增 `get_client()`：返回适配器自身（对应基类预留接口，synochat 等适配器即借此被群分析等插件发现）
+  - 新增 `platform` 属性：返回 `"flowbot_adapter"`（第三方 `_detect_platform_name` 优先读取）
+  - 新增 `send_proactive_by_session`：主动发送消息标准接口（与 `send_by_session` 同实现）
+  - `meta().name` 统一为 `"flowbot_adapter"`，各类名称对齐
+- 注：上述仅保证本适配器**可被发现**；第三方插件（如群分析）仍需自行注册 `flowbot_adapter` 到其 DDD 适配器工厂才能拉取历史消息
+
+## v1.1.1 — 2026-08-07
+
+### 变更
+- **移除会话预载定时轮询**：删除 `_load_sessions_loop`（每 5 分钟 `GET /api/v1/sessions` + 日志）。`_sessions_cache` 现仅由入站消息驱动更新（`_handle_message` 每次消息写入对应会话），减少每 5 分钟一次的 HTTP 请求与日志输出，降低资源占用。`_sessions_cache` 当前无消费点，移除轮询不影响功能
+
 ## v1.1.0 — 2026-08-07
 
 ### 变更

@@ -140,7 +140,6 @@ class FlowBotPlatform(Platform):
 
         self._stop_event = asyncio.Event()
         self._ws_task: asyncio.Task | None = None
-        self._loader_task: asyncio.Task | None = None
         self._http: aiohttp.ClientSession | None = None
 
         self._seen_ids: dict[str, float] = {}
@@ -173,10 +172,17 @@ class FlowBotPlatform(Platform):
             support_proactive_message=True,
         )
 
+    @property
+    def platform(self) -> str:
+        """平台标识：供第三方插件按标准接口探测（如 _detect_platform_name）。"""
+        return "flowbot_adapter"
+
+    def get_client(self) -> object:
+        """返回客户端对象自身，供第三方插件按 AstrBot Platform 标准发现本适配器。"""
+        return self
+
     async def run(self):
         self._stop_event.clear()
-        if self._loader_task is None or self._loader_task.done():
-            self._loader_task = asyncio.create_task(self._load_sessions_loop())
         self._ws_task = asyncio.create_task(self._run_ws_loop())
         try:
             await self._ws_task
@@ -185,13 +191,12 @@ class FlowBotPlatform(Platform):
 
     async def terminate(self):
         self._stop_event.set()
-        for task in (self._ws_task, self._loader_task):
-            if task and not task.done():
-                task.cancel()
-                try:
-                    await task
-                except (asyncio.CancelledError, Exception):
-                    pass
+        if self._ws_task and not self._ws_task.done():
+            self._ws_task.cancel()
+            try:
+                await self._ws_task
+            except (asyncio.CancelledError, Exception):
+                pass
         if self._http is not None:
             await self._http.close()
             self._http = None
@@ -512,6 +517,15 @@ class FlowBotPlatform(Platform):
         session_id = raw.split(":", 2)[-1]
         await self._send_to_session(session_id, message_chain)
 
+    async def send_proactive_by_session(
+        self, session, message_chain: MessageChain
+    ) -> dict | None:
+        """主动发送消息（AstrBot Platform 标准接口）。"""
+        raw = str(getattr(session, "session_id", "") or "")
+        session_id = raw.split(":", 2)[-1]
+        await self._send_to_session(session_id, message_chain)
+        return {"success": True}
+
     async def _send_to_session(self, session_id: str, message_chain: MessageChain):
         text_parts: list[str] = []
         images: list[Image] = []
@@ -788,27 +802,7 @@ class FlowBotPlatform(Platform):
             logger.warning(f"FlowBot 媒体上传异常: {e}")
             return None
 
-    # ── 会话预载（昵称映射） ─────────────────────────────────────────────
-
-    async def _load_sessions_loop(self):
-        while not self._stop_event.is_set():
-            try:
-                data = await self._api_json("GET", "/api/v1/sessions")
-                items = []
-                if isinstance(data, list):
-                    items = data
-                elif isinstance(data, dict):
-                    items = data.get("data") or data.get("sessions") or []
-                for item in items:
-                    if isinstance(item, dict):
-                        sid = item.get("session_id") or item.get("id")
-                        if sid:
-                            self._cache_session(str(sid), item)
-                if items:
-                    logger.info(f"FlowBot 会话预载完成: {len(items)} 个会话")
-            except Exception as e:
-                logger.debug(f"FlowBot 会话预载失败: {e}")
-            await asyncio.sleep(300)
+    # ── 会话缓存（仅由消息驱动更新，无定时轮询） ──────────────────────────
 
 
 class FlowBotMention(BaseMessageComponent):
