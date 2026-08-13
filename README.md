@@ -27,7 +27,7 @@ FlowBot 平台适配器：通过 **FlowBot Docker WebUI 统一端口**连接微�
 | `flowbot_reconnect_interval` | int | `5` | 断线重连初始间隔（秒），指数退避，上限 60s |
 | `flowbot_reconnect_max_attempts` | int | `5` | 断线重连最大次数，超过即停止（避免影响性能与日志）；填 0 表示不限制 |
 | `flowbot_use_direct_url` | bool | `false` | 允许透传图片 URL 而非下载 base64（省流量），发送失败自动回退 base64 |
-| `flowbot_image_size_threshold` | int | `10` | 图片 base64 阈值（MB），超过则透传 URL 或尝试上传 token |
+| `flowbot_image_size_threshold` | int | `5` | 图片 base64 阈值（MB），超过则透传 URL 或尝试上传 token；避免微信粘贴大图冻结 |
 
 ## 安装
 
@@ -35,24 +35,51 @@ FlowBot 平台适配器：通过 **FlowBot Docker WebUI 统一端口**连接微�
 2. 填写上述配置，`flowbot_host` 填能访问到 FlowBot Docker 宿主机的 IP（若 AstrBot 与 FlowBot 同机，可填 `127.0.0.1`），`flowbot_port` 填 7400。
 3. 重载插件后，控制台应显示 `FlowBot WS 已连接`。
 
+## 第三方插件调用接口（能力钩子层）
+
+插件经 `context.get_platform_inst("flowbot_adapter")` 获取平台实例后，可直接调用：
+
+| 类别 | 方法 |
+|------|------|
+| 群查询 | `get_group_list()` / `get_group_info(group_id)` / `get_group_avatar(group_id)` |
+| 成员查询 | `get_member_list(group_id)` / `get_member_info(group_id, user_id)` / `get_member_avatar_url(group_id, user_id)` |
+| 发送 | `send_text(session_id, content, at_users=None, reply_to=None)` / `send_image(session_id, image)` / `send_message_chain(session_id, chain)` |
+| 标准 | `send_by_session` / `send_proactive_by_session` / `get_client` / `get_self_id` |
+| 能力 | `capabilities()` |
+
+示例：
+```python
+from astrbot.api.message_components import MessageChain, Plain
+
+platform = context.get_platform_inst("flowbot_adapter")
+await platform.send_text("25451799968@chatroom", "群分析报告已生成", at_users=["all"])
+groups = await platform.get_group_list()
+avatar = await platform.get_member_avatar_url(groups[0].group_id, "wxid_xxx")
+```
+
 ## 消息能力
 
-- 文本、图片收发
+- 文本、图片收发（消息时间戳透传 flowbot 推送的真实发送时间）
 - 群聊 / 私聊（会话类型判断，群回复目标为群会话）
 - 群 @ 发送（`at_users`，支持 `FlowBotMention(wxid=...)` 自研组件与 AstrBot 内置 `At(qq=...)` 兼容；`"all"` = @全体）
 - 回复消息（`reply_to`，需对端支持）
+- 群/成员查询（第三方插件可用）：`get_group_list` / `get_group_info` / `get_member_list` / `get_member_info`（懒加载 + 60s 缓存）
+- 头像：入站推送 `avatar_url` 随 `raw_message` 透传；`get_group_avatar` / `get_member_avatar_url` 查询群/成员头像
+- 文件发送：flowbot Linux 容器不支持，`File` 组件记 warning 降级日志
 
 ## 图片发送策略
 
 - 本机文件存在 → `image_base64`（读文件）+ `image_path`（同主机兼容）
-- `base64://` / `data:` URI 源（如 T2I output_pro 产物）→ 直接提取 base64 串进 `image_base64`，不落盘不二次下载
+- `base64://` / `data:` / **裸 base64** URI 源（如 T2I output_pro 产物）→ 直接提取 base64 串进 `image_base64`，不落盘不二次下载
 - `file:///` 形态 → 剥前缀后按本地文件处理
 - URL 源且 `flowbot_use_direct_url=true` → 直接透传 `image_url`（省流量），同时预下载一份本地缓存；若透传失败且有本地文件，自动回退以 `image_base64` 重发
 - URL 源默认（透传关闭）→ 下载后以 `image_base64` 发送
-- 文件超过 `flowbot_image_size_threshold`（MB，默认 10）→ 有 URL 则透传 URL；无 URL 则调用 `POST /api/v1/media/upload`（JSON `{"image_base64": ...}`）拿 `image_token`
-- 图片下载超时 15s，上限 20MB，失败记日志并跳过
+- 文件超过 `flowbot_image_size_threshold`（MB，默认 5）→ **直接跳过**（flowbot 硬上限 5MB，>5MB 所有来源拒绝）
+- 入站图片源归一化：FlowBot 推送的 `image_base64` / `base64://` / `data:` / 裸 base64 / URL / 本地路径均转成规范 `Image` 组件；base64 形态不落盘
+- 临时文件上限 100 个，超限自动清理最旧，防空间膨胀
+- 图片下载超时 15s，上限 5MB，失败记日志并跳过
 - WebSocket 心跳保活 30s，及时检测断线
-- FlowBot body 上限 20MB（base64 约承载 15MB 原图）
+- FlowBot 图片硬上限 5MB（体积 >5MB 或宽/高 >4096px 拒绝；粘贴熔断 30s）
 
 ## 注意事项
 

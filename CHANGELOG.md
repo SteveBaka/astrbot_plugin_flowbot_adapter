@@ -2,6 +2,83 @@
 
 本插件所有版本更新记录。版本遵循语义化版本（`vMAJOR.MINOR.PATCH`）。
 
+## v1.2.6 — 2026-08-14
+
+### 变更（对齐 flowbot 5MB 硬上限）
+- **`_MAX_DOWNLOAD_BYTES`** 10 → **5MB**（flowbot 所有图片来源统一 5MB 限制，不再下载 >5MB 图）
+- **`capabilities()["image_max_bytes"]`** 10 → **5MB**
+- **`_send_image` 路由简化**：base64 源与本地文件 >5MB **直接跳过**（不再尝试 media/upload token 或 URL 透传——flowbot 已拒）；≤5MB 一律 base64 直发
+- `_upload_media` 保留（供未来/大图场景），但当前发送路径不再调用
+- use_direct_url 的 URL 透传保留（适配器无法本地探测 URL 图片大小，由 flowbot 侧校验拒绝）
+
+## v1.2.5 — 2026-08-14
+
+### 变更（图片大小阈值整体下调，防微信粘贴大图冻结）
+- **base64 直发阈值**：`flowbot_image_size_threshold` 默认 10 → **5MB**（≤5MB 走 base64 直发，微信粘贴流畅）
+- **下载硬上限**：`_MAX_DOWNLOAD_BYTES` 20 → **10MB**（>10MB 不再下载，避免大图处理卡顿）
+- **能力声明**：`capabilities()["image_max_bytes"]` 同步为 10MB
+- 发送路由：≤5MB base64 直发 → 5-10MB 有 URL 透传 / 无 URL 走 media/upload token（flowbot 上限 20MB，上传通道不走微信粘贴，安全）→ >10MB 拦截下载
+
+## v1.2.4 — 2026-08-14
+
+### 变更
+- **适配 flowbot 推送契约 v1**（feat/session-avatar-enrich，3dff6a81）：
+  - sender 昵称兜底链：`sender_name` → `sender_card` → `source_name` → `sender_id`（flowbot 新增 `sender_name`，旧契约兼容）
+  - 群消息 `abm.group.group_avatar` 填充 `group_avatar_url`（flowbot 新契约：`avatar_url` 群消息置空、群头像移入 `group_avatar_url`）
+  - 新增 `_inbound_group_avatars` 缓存：入站 `group_avatar_url` 实时缓存，`get_group_avatar()` 优先取用，sessions 兜底
+
+### 说明
+- `avatar_url` 语义已按上游契约改为"发送者头像"；群消息该字段为空，发送者头像由 `get_member_avatar_url` 经 group-members 查询
+
+## v1.2.3 — 2026-08-13
+
+### 新增
+- **第三方插件可调用的能力钩子层**（插件经 `context.get_platform_inst("flowbot_adapter")` 获取实例后直接调用）：
+  - `capabilities()`：能力声明（支持 text/image/at/reply/group/proactive/avatar，不支持 file/voice/video，max_text_length=1800）
+  - `send_text(session_id, content, at_users=None, reply_to=None)`：便捷文本发送
+  - `send_image(session_id, image)`：便捷图片发送（Image 组件或路径/URL/base64 字符串）
+  - `send_message_chain(session_id, message_chain)`：便捷消息链发送
+  - `get_self_id()`：平台级机器人标识
+
+### 说明
+- 完整对外 API 面：查询（`get_group_list/get_group_info/get_group_avatar/get_member_list/get_member_info/get_member_avatar_url`）、发送（`send_text/send_image/send_message_chain/send_by_session/send_proactive_by_session`）、能力（`capabilities`）、标准（`get_client/platform/meta`）
+
+## v1.2.2 — 2026-08-09
+
+### 新增
+- **群头像透传**：`get_group_list` 填充 `Group.group_avatar`（flowbot sessions 接口 enrich 的 `avatarUrl`），新增 `get_group_avatar(group_id)`
+- **成员头像查询**：新增 `get_member_avatar_url(group_id, user_id)`（`GET /api/v1/group-members` 的 `avatarUrl` 字段，独立缓存通道）
+- **File 组件降级日志**：`_send_to_session` 对 `File` 组件记录 warning 日志（flowbot Linux 容器不支持文件发送，避免静默丢弃导致排查困惑）
+
+### 说明
+- 入站消息头像：flowbot 推送的 `avatar_url` 已随 `abm.raw_message` 透传（`raw_message` 即推送 data），插件侧 `event.message_obj.raw_message.get("avatar_url")` 可取；群成员头像可经 `get_member_avatar_url` 获取
+
+## v1.2.1 — 2026-08-08
+
+### 新增
+- **消息时间戳透传**：`convert_message` 读取 flowbot 推送的 `timestamp`（unix 秒，来源 WCDB createTime）写入 `AstrBotMessage.timestamp`，供时段统计/增量游标使用真实发送时间；缺省回退到达时间
+- **群列表/群成员按需查询**（面向第三方插件，懒加载 + 60s TTL 缓存，非轮询）：
+  - `get_group_list()` / `get_group_info(group_id)`：`GET /api/v1/sessions` 过滤 `sessionType=="group"`，群名=`displayName`，群标识=`username`
+  - `get_member_list(group_id)` / `get_member_info(group_id, user_id)`：`GET /api/v1/group-members`，成员昵称优先 `displayName`/`groupNickname`/`nickname`
+
+### 变更
+- `_upload_media` 上传 token 字段按 flowbot 契约确认：`token` 优先（原 `image_token` 在首位）
+
+### 说明
+- B1（File 发送）确认 flowbot Linux 容器不支持，不实施；HTML 报告用图片渲染替代
+
+## v1.2.0 — 2026-08-08
+
+### 新增
+- **入站图片源归一化**（`_normalize_inbound_image`）：FlowBot 推送的图片现支持 `image_base64`、`base64://`、`data:`、裸 base64、http(s) URL、本地路径等多种形态，统一转成规范的 AstrBot `Image` 组件。base64 形态**不落盘**（直接构造 `Image(file=base64://...)`），仅 URL/路径才下载
+- **出站裸 base64 识别**：`_send_image` 新增无前缀裸 base64 识别（`_looks_like_base64` 保守判定：长度、路径/URL 特征排除、字符集校验），第三方插件即使产出无前缀 base64 也能被吃进
+
+### 优化
+- **临时文件容量上限**：`_temp_files` 由无序 set 改为 dict（path→mtime），超过 `_MAX_TEMP_FILES`（100）时按最旧清理，防长期运行空间无限膨胀；`_trim_temp_files` 在登记时即触发
+
+### 说明
+- base64 仅在无更优来源时作为保底：优先走本地文件 → base64、URL 透传、media 上传 token；新增的裸 base64/入站 base64 识别均是"兜底兼容"而非首选路径
+
 ## v1.1.2 — 2026-08-07
 
 ### 变更

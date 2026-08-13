@@ -5,7 +5,7 @@ import os
 import tempfile
 import time
 from collections import deque
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse
 
 try:
     import aiohttp
@@ -35,6 +35,7 @@ from astrbot.api.message_components import (
     AtAll,
     BaseMessageComponent,
     ComponentType,
+    File,
     Image,
     Plain,
     Reply,
@@ -55,8 +56,15 @@ _DEFAULT_RECONNECT = 5
 _DEFAULT_MAX_RECONNECT_ATTEMPTS = 5
 _DEDUP_WINDOW = 600
 _RECENT_SEND_TTL = 3
-_MAX_DOWNLOAD_BYTES = 20 * 1024 * 1024  # 单次图片下载大小上限 20MB
+_MAX_DOWNLOAD_BYTES = 5 * 1024 * 1024  # 单次图片下载大小上限 5MB（flowbot 硬上限）
 _WS_PING_INTERVAL = 30  # WebSocket 心跳间隔（秒），用于检测半开连接
+_MAX_TEMP_FILES = 100  # 本地临时文件追踪上限，超出清理最旧，防止无限膨胀
+_BARE_B64_MIN_LEN = 64  # 裸 base64 识别的最小长度阈值，避免误伤短路径/URL
+_B64_CHARSET = set(
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/="
+)
+_SESSIONS_TTL = 60  # 群列表缓存 TTL（秒）
+_MEMBERS_TTL = 60  # 群成员缓存 TTL（秒）
 
 
 @register_platform_adapter(
@@ -69,7 +77,7 @@ _WS_PING_INTERVAL = 30  # WebSocket 心跳间隔（秒），用于检测半开�
         "flowbot_reconnect_interval": _DEFAULT_RECONNECT,
         "flowbot_reconnect_max_attempts": _DEFAULT_MAX_RECONNECT_ATTEMPTS,
         "flowbot_use_direct_url": False,
-        "flowbot_image_size_threshold": 10,
+        "flowbot_image_size_threshold": 5,
     },
     config_metadata={
         "flowbot_host": {
@@ -106,7 +114,7 @@ _WS_PING_INTERVAL = 30  # WebSocket 心跳间隔（秒），用于检测半开�
         "flowbot_image_size_threshold": {
             "description": "图片 base64 阈值（MB）",
             "type": "int",
-            "hint": "超过该大小的图片不再用 base64，改为透传 URL 或尝试上传获取 token。FlowBot body 上限 20MB（base64 约承载 15MB 原图），默认 10",
+            "hint": "超过该大小的图片不再用 base64 直发（避免微信粘贴大图冻结），改为透传 URL 或尝试上传获取 token。默认 5；下载/上传硬上限 10MB",
         },
     },
 )
@@ -146,8 +154,13 @@ class FlowBotPlatform(Platform):
         self._recent_sends: deque[tuple[str, str, float]] = deque(maxlen=50)
         self._sessions_cache: dict[str, dict] = {}
         self._MAX_SESSIONS_CACHE = 2000
-        self._temp_files: set[str] = set()
+        self._temp_files: dict[str, float] = {}  # path -> mtime，用于容量清理
         self._stats = {"recv": 0, "sent": 0}
+        # 按需懒加载缓存：key -> (fetched_at, value)
+        self._group_cache: dict[str, tuple[float, list]] = {}
+        self._member_cache: dict[str, tuple[float, list]] = {}
+        # 入站推送的群头像缓存：group_id -> group_avatar_url（flowbot 新契约 group_avatar_url）
+        self._inbound_group_avatars: dict[str, str] = {}
 
     def _cache_session(self, session_id: str, item: dict):
         """写入会话缓存，超出容量时清理最旧条目，防止无限增长。"""
@@ -159,6 +172,109 @@ class FlowBotPlatform(Platform):
                 : len(self._sessions_cache) - self._MAX_SESSIONS_CACHE
             ]:
                 self._sessions_cache.pop(k, None)
+
+    # ── 群/成员按需查询（懒加载 + TTL 缓存，供第三方插件使用） ───────────
+
+    async def get_group_list(self) -> list[Group]:
+        """查询群列表（GET /api/v1/sessions，sessionType==group）。按需懒加载，60s 缓存。"""
+        now = time.time()
+        cached = self._group_cache.get("__all__")
+        if cached and now - cached[0] < _SESSIONS_TTL:
+            return cached[1]
+        data = await self._api_json("GET", "/api/v1/sessions")
+        items = []
+        if isinstance(data, dict):
+            items = data.get("sessions") or []
+        elif isinstance(data, list):
+            items = data
+        groups = []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            if str(item.get("sessionType") or "").lower() != "group":
+                continue
+            groups.append(
+                Group(
+                    group_id=str(item.get("username") or ""),
+                    group_name=str(item.get("displayName") or ""),
+                    group_avatar=str(item.get("avatarUrl") or "") or None,
+                )
+            )
+        self._group_cache["__all__"] = (now, groups)
+        return groups
+
+    async def get_group_info(self, group_id: str) -> Group | None:
+        """查询单个群信息（从群列表缓存中匹配）。"""
+        groups = await self.get_group_list()
+        for g in groups:
+            if g.group_id == group_id:
+                return g
+        return None
+
+    async def get_group_avatar(self, group_id: str) -> str | None:
+        """查询群头像 URL：优先入站推送的 group_avatar_url（实时），其次 sessions enrich 的 avatarUrl。"""
+        if group_id and group_id in self._inbound_group_avatars:
+            return self._inbound_group_avatars.get(group_id) or None
+        info = await self.get_group_info(group_id)
+        return getattr(info, "group_avatar", None) or None
+
+    async def get_member_list(self, group_id: str) -> list[MessageMember]:
+        """查询群成员列表（GET /api/v1/group-members）。按需懒加载，60s 缓存。"""
+        now = time.time()
+        cached = self._member_cache.get(group_id)
+        if cached and now - cached[0] < _MEMBERS_TTL:
+            return cached[1]
+        url = f"/api/v1/group-members?chatroomId={quote(group_id)}&forceRefresh=0"
+        data = await self._api_json("GET", url)
+        items = []
+        if isinstance(data, dict):
+            items = data.get("members") or []
+        members = []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            members.append(
+                MessageMember(
+                    user_id=str(item.get("wxid") or ""),
+                    nickname=str(
+                        item.get("displayName")
+                        or item.get("groupNickname")
+                        or item.get("nickname")
+                        or ""
+                    ),
+                )
+            )
+        self._member_cache[group_id] = (now, members)
+        return members
+
+    async def get_member_avatar_url(self, group_id: str, user_id: str) -> str | None:
+        """查询群成员头像 URL（GET /api/v1/group-members 的 avatarUrl 字段）。"""
+        now = time.time()
+        cached = self._member_cache.get(group_id)
+        items = None
+        if cached and now - cached[0] < _MEMBERS_TTL:
+            items = getattr(cached[1], "_raw", None)
+        if items is None:
+            url = f"/api/v1/group-members?chatroomId={quote(group_id)}&forceRefresh=0"
+            data = await self._api_json("GET", url)
+            if isinstance(data, dict):
+                items = data.get("members") or []
+        if not items:
+            return None
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            if str(item.get("wxid") or "") == str(user_id):
+                return str(item.get("avatarUrl") or "") or None
+        return None
+
+    async def get_member_info(self, group_id: str, user_id: str) -> MessageMember | None:
+        """查询单个群成员信息（从成员列表缓存中匹配）。"""
+        members = await self.get_member_list(group_id)
+        for m in members:
+            if m.user_id == user_id:
+                return m
+        return None
 
     # ── 基础 ──────────────────────────────────────────────────────────
 
@@ -367,16 +483,32 @@ class FlowBotPlatform(Platform):
         abm.message_id = str(data.get("message_id") or "")
         abm.sender = MessageMember(
             user_id=str(data.get("sender_id") or ""),
-            nickname=str(data.get("sender_name") or "")
-            or str(data.get("sender_id") or ""),
+            nickname=str(
+                data.get("sender_name")
+                or data.get("sender_card")
+                or data.get("source_name")
+                or data.get("sender_id")
+                or ""
+            ),
         )
         # 机器人自身 wxid（flowbot 推送新增 self_id，供 AstrBot 识别"@登录账号"）
         abm.self_id = str(data.get("self_id") or "")
+        # 消息时间戳：flowbot 推送含 unix 秒 timestamp（来源 WCDB createTime），
+        # 透传真实发送时间，供时段统计/增量游标使用；缺省回退到达时间
+        try:
+            abm.timestamp = int(data.get("timestamp") or 0) or int(time.time())
+        except (TypeError, ValueError):
+            abm.timestamp = int(time.time())
         if is_group:
             # 为群消息设置群信息，避免 AstrBot 群上下文错误（回退到 sender.group_id）
+            group_avatar = str(data.get("group_avatar_url") or "") or None
+            if group_avatar:
+                # flowbot 新契约：群消息置空 avatar_url、新增 group_avatar_url 承载群头像
+                self._inbound_group_avatars[abm.session_id] = group_avatar
             abm.group = Group(
                 group_id=abm.session_id,
                 group_name=str(data.get("group_name") or ""),
+                group_avatar=group_avatar,
             )
         abm.raw_message = data
 
@@ -386,13 +518,7 @@ class FlowBotPlatform(Platform):
 
         components = []
         if mtype == "image":
-            url = data.get("image_url") or (text if text.startswith("http") else "")
-            local = (
-                await self._download_image(self._fix_image_url(url)) if url else None
-            )
-            components.append(
-                Image(file=local, url=url) if local else Plain(text=f"[图片] {text}")
-            )
+            components.append(await self._normalize_inbound_image(data, text))
         elif mtype == "emoji":
             emoji_url = data.get("emoji_url") or ""
             local = (
@@ -422,6 +548,53 @@ class FlowBotPlatform(Platform):
                 )
         abm.message = components
         return abm
+
+    async def _normalize_inbound_image(self, data: dict, text: str):
+        """入站图片源归一化：支持 base64://、data:、裸 base64、http(s)、本地路径。
+
+        base64 形态直接构造 Image(file=base64://...)，不落盘，省空间；
+        仅 http(s) URL 与本地路径才下载/透传。
+        """
+        url = str(data.get("image_url") or "")
+        base64_src = str(data.get("image_base64") or "")
+        content = str(data.get("content") or "")
+
+        # 1. 显式 base64:// / data: / 裸 base64 → 不落盘
+        if base64_src:
+            stripped = base64_src.strip()
+            if stripped.startswith("base64://"):
+                stripped = stripped[len("base64://") :]
+            elif stripped.startswith("data:") and "," in stripped:
+                stripped = stripped.split(",", 1)[-1]
+            if stripped:
+                return Image(file=f"base64://{stripped}", url="")
+
+        # 2. 文本内嵌 base64（如 [图片]base64://... / data:image/png;base64,...）
+        if content.startswith("base64://"):
+            return Image(file=content, url="")
+        if content.startswith("data:") and "," in content:
+            b64_body = content.split(",", 1)[-1]
+            if _looks_like_base64(b64_body):
+                return Image(file=f"base64://{b64_body}", url="")
+
+        # 3. 裸 base64 文本
+        if _looks_like_base64(content):
+            return Image(file=f"base64://{content}", url="")
+
+        # 4. http(s) URL → 下载（已含 _fix_image_url 容器内地址改写）
+        if url.startswith("http"):
+            local = await self._download_image(self._fix_image_url(url))
+            if local:
+                return Image(file=local, url=url)
+
+        # 5. content 本身是 http URL（无 image_url 字段时的兜底）
+        if content.startswith("http"):
+            local = await self._download_image(self._fix_image_url(content))
+            if local:
+                return Image(file=local, url=content)
+
+        # 6. 兜底：文本占位
+        return Plain(text=f"[图片] {text}")
 
     async def handle_msg(self, message: AstrBotMessage):
         event = FlowBotMessageEvent(
@@ -491,14 +664,30 @@ class FlowBotPlatform(Platform):
             return None
 
     def _track_temp_file(self, path: str):
-        """登记本适配器创建的临时文件，用于后续统一清理。"""
-        if path:
-            self._temp_files.add(path)
+        """登记本适配器创建的临时文件，超出容量时清理最旧，防无限膨胀。"""
+        if not path:
+            return
+        self._temp_files[path] = time.time()
+        self._trim_temp_files()
 
     def _forget_temp_file(self, path: str):
         """解除临时文件登记（配合 track_temporary_local_file 由 AstrBot 清理）。"""
         if path:
-            self._temp_files.discard(path)
+            self._temp_files.pop(path, None)
+
+    def _trim_temp_files(self):
+        """超出容量上限时，删除最旧的临时文件。"""
+        if len(self._temp_files) <= _MAX_TEMP_FILES:
+            return
+        excess = len(self._temp_files) - _MAX_TEMP_FILES
+        oldest = sorted(self._temp_files.items(), key=lambda kv: kv[1])[:excess]
+        for path, _ in oldest:
+            try:
+                if os.path.isfile(path):
+                    os.remove(path)
+            except OSError:
+                pass
+            self._temp_files.pop(path, None)
 
     def _cleanup_temp_files(self):
         """删除本适配器创建且仍未被使用/登记的临时文件。"""
@@ -525,6 +714,70 @@ class FlowBotPlatform(Platform):
         session_id = raw.split(":", 2)[-1]
         await self._send_to_session(session_id, message_chain)
         return {"success": True}
+
+    # ── 第三方插件可调用的便捷 API（经 context.get_platform_inst(id) 获取实例） ──
+
+    def capabilities(self) -> dict:
+        """能力声明：供第三方插件判断本适配器支持范围。"""
+        return {
+            "platform": "flowbot_adapter",
+            "supports_text": True,
+            "supports_image": True,
+            "supports_file": False,  # flowbot Linux 容器不支持文件发送
+            "supports_voice": False,
+            "supports_video": False,
+            "supports_at": True,
+            "supports_reply": True,
+            "supports_group": True,
+            "supports_proactive": True,
+            "supports_avatar": True,  # 群/成员头像（sessions/group-members enrich）
+            "max_text_length": 1800,
+            "image_max_bytes": 5 * 1024 * 1024,
+        }
+
+    async def send_text(
+        self,
+        session_id: str,
+        content: str,
+        at_users: list[str] | None = None,
+        reply_to: str | None = None,
+    ) -> bool:
+        """便捷文本发送（第三方插件调用）。返回是否发送成功。"""
+        payload: dict = {
+            "session_id": session_id,
+            "type": "text",
+            "content": content or "",
+        }
+        if at_users:
+            payload["at_users"] = at_users
+        if reply_to:
+            payload["reply_to"] = reply_to
+        result = await self._api_json("POST", "/api/v1/messages/send", payload)
+        if result is not None:
+            self._stats["sent"] += 1
+            self._mark_sent(session_id, content or "")
+            return True
+        return False
+
+    async def send_image(
+        self, session_id: str, image: Image | str
+    ) -> bool:
+        """便捷图片发送（第三方插件调用）。image 可为 Image 组件或路径/URL/base64 字符串。"""
+        if isinstance(image, str):
+            image = Image(file=image)
+        await self._send_image(session_id, image, None)
+        return True
+
+    async def send_message_chain(
+        self, session_id: str, message_chain: MessageChain
+    ) -> bool:
+        """便捷消息链发送（第三方插件调用）。"""
+        await self._send_to_session(session_id, message_chain)
+        return True
+
+    async def get_self_id(self) -> str:
+        """返回平台级机器人标识（meta().id）。真实 wxid 由入站消息 self_id 提供。"""
+        return str(self.config.get("id", "flowbot_adapter"))
 
     async def _send_to_session(self, session_id: str, message_chain: MessageChain):
         text_parts: list[str] = []
@@ -557,6 +810,12 @@ class FlowBotPlatform(Platform):
                 reply_to = str(comp.id or "")
             elif isinstance(comp, Image):
                 images.append(comp)
+            elif isinstance(comp, File):
+                # flowbot Linux 容器不支持文件发送（仅 text/image），记录降级日志便于排查
+                logger.warning(
+                    f"FlowBot 不支持文件发送，已忽略 (session={session_id}, "
+                    f"name={getattr(comp, 'name', '') or ''})"
+                )
 
         text = "".join(text_parts).strip()
         if text:
@@ -590,12 +849,12 @@ class FlowBotPlatform(Platform):
         use_direct_url = bool(self.config.get("flowbot_use_direct_url", False))
         try:
             threshold_bytes = (
-                max(1, int(self.config.get("flowbot_image_size_threshold", 10) or 10))
+                max(1, int(self.config.get("flowbot_image_size_threshold", 5) or 5))
                 * 1024
                 * 1024
             )
         except (TypeError, ValueError):
-            threshold_bytes = 10 * 1024 * 1024
+            threshold_bytes = 5 * 1024 * 1024
 
         payload: dict = {"session_id": session_id, "type": "image"}
         if reply_to:
@@ -614,6 +873,9 @@ class FlowBotPlatform(Platform):
             b64_source = candidate[len("base64://") :]
         elif candidate.startswith("data:") and "," in candidate:
             b64_source = candidate.split(",", 1)[-1]
+        elif _looks_like_base64(candidate):
+            # 裸 base64（无前缀）：仅当不可能是路径/URL 时识别，避免误伤
+            b64_source = candidate
 
         if b64_source:
             b64_source = b64_source.strip()
@@ -625,17 +887,13 @@ class FlowBotPlatform(Platform):
             # 估算原始大小 = base64 长度 × 3/4
             size = len(b64_source) * 3 // 4
             if size > threshold_bytes:
-                token = await self._upload_media(b64=b64_source)
-                if token:
-                    payload["image_token"] = token
-                else:
-                    logger.warning(
-                        f"FlowBot 图片 {size} 字节超过阈值 {threshold_bytes}，"
-                        f"且上传失败，已跳过"
-                    )
-                    return
-            else:
-                payload["image_base64"] = b64_source
+                # flowbot 硬上限 5MB，所有来源 >5MB 拒绝，直接跳过
+                logger.warning(
+                    f"FlowBot 图片 {size} 字节超过 5MB 上限，已跳过 "
+                    f"(session={session_id})"
+                )
+                return
+            payload["image_base64"] = b64_source
             result = await self._api_json("POST", "/api/v1/messages/send", payload)
             if result is not None:
                 self._stats["sent"] += 1
@@ -677,28 +935,22 @@ class FlowBotPlatform(Platform):
                 payload["image_url"] = direct_url
             elif local_path:
                 size = os.path.getsize(local_path)
-                if size > threshold_bytes and direct_url:
-                    payload["image_url"] = direct_url
-                elif size > threshold_bytes:
-                    token = await self._upload_media(local_path=local_path)
-                    if token:
-                        payload["image_token"] = token
-                    else:
-                        logger.warning(
-                            f"FlowBot 图片 {size} 字节超过阈值 {threshold_bytes}，"
-                            f"且无 URL 可透传、上传失败，已跳过"
+                if size > threshold_bytes:
+                    # flowbot 硬上限 5MB（URL 同限），直接跳过
+                    logger.warning(
+                        f"FlowBot 图片 {size} 字节超过 5MB 上限，已跳过 "
+                        f"(session={session_id})"
+                    )
+                    return
+                try:
+                    with open(local_path, "rb") as f:
+                        payload["image_base64"] = base64.b64encode(f.read()).decode(
+                            "ascii"
                         )
-                        return
-                else:
-                    try:
-                        with open(local_path, "rb") as f:
-                            payload["image_base64"] = base64.b64encode(f.read()).decode(
-                                "ascii"
-                            )
-                    except Exception as e:
-                        logger.warning(f"FlowBot 图片 base64 读取失败: {e}")
-                        return
-                    payload["image_path"] = local_path  # 同主机部署兼容
+                except Exception as e:
+                    logger.warning(f"FlowBot 图片 base64 读取失败: {e}")
+                    return
+                payload["image_path"] = local_path  # 同主机部署兼容
             else:
                 # 兜底：走 AstrBot 官方归一化（统一处理 base64:// file:/// http 纯路径）
                 try:
@@ -792,7 +1044,8 @@ class FlowBotPlatform(Platform):
                     for container in (inner, result):
                         if not isinstance(container, dict):
                             continue
-                        for k in ("image_token", "token", "file_token", "media_id"):
+                        # flowbot 契约确认：返回字段为 token
+                        for k in ("token", "image_token", "file_token", "media_id"):
                             if container.get(k):
                                 return str(container[k])
                     if isinstance(inner, str) and inner:
@@ -871,6 +1124,21 @@ def _guess_suffix(url: str) -> str:
         if path.endswith(ext):
             return ext
     return ".jpg"
+
+
+def _looks_like_base64(s: str) -> bool:
+    """判断字符串是否像裸 base64 图片数据（无 base64:// 前缀）。
+
+    仅当长度足够、不含路径/URL 特征、字符集合法时才判定，避免误伤本地路径。
+    """
+    s = s.strip()
+    if len(s) < _BARE_B64_MIN_LEN:
+        return False
+    if "://" in s or "/" in s or os.sep in s:
+        return False
+    if not s or len(s) % 4 != 0:
+        return False
+    return all(c in _B64_CHARSET for c in s)
 
 
 def _mask_host(base: str) -> str:
