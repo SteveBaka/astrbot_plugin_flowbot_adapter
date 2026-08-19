@@ -158,7 +158,9 @@ class FlowBotPlatform(Platform):
         self._stats = {"recv": 0, "sent": 0}
         # 按需懒加载缓存：key -> (fetched_at, value)
         self._group_cache: dict[str, tuple[float, list]] = {}
-        self._member_cache: dict[str, tuple[float, list]] = {}
+        # 成员缓存：group_id -> (fetched_at, list[MessageMember], list[原始 member dict])
+        # 保留原始 dict 以便 get_member_avatar_url 直接复用同一份请求结果（头像 URL 在 avatarUrl）。
+        self._member_cache: dict[str, tuple[float, list, list]] = {}
         # 入站推送的群头像缓存：group_id -> group_avatar_url（flowbot 新契约 group_avatar_url）
         self._inbound_group_avatars: dict[str, str] = {}
 
@@ -218,21 +220,33 @@ class FlowBotPlatform(Platform):
         info = await self.get_group_info(group_id)
         return getattr(info, "group_avatar", None) or None
 
-    async def get_member_list(self, group_id: str) -> list[MessageMember]:
-        """查询群成员列表（GET /api/v1/group-members）。按需懒加载，60s 缓存。"""
+    async def get_member_list(
+        self, group_id: str, force_refresh: bool = False
+    ) -> list[MessageMember]:
+        """查询群成员列表（GET /api/v1/group-members）。按需懒加载，60s 缓存。
+
+        force_refresh=True 时强制绕过 TTL 刷新（供调用方在成员缺失昵称/头像时自救）。
+        上游请求失败时不写空缓存，回退返回过期的已缓存成员，避免短暂接口故障造成
+        整组成员"无昵称/无头像"长达 TTL。
+        """
         now = time.time()
         cached = self._member_cache.get(group_id)
-        if cached and now - cached[0] < _MEMBERS_TTL:
+        if not force_refresh and cached and now - cached[0] < _MEMBERS_TTL:
             return cached[1]
-        url = f"/api/v1/group-members?chatroomId={quote(group_id)}&forceRefresh=0"
+        url = f"/api/v1/group-members?chatroomId={quote(group_id)}&forceRefresh={1 if force_refresh else 0}"
         data = await self._api_json("GET", url)
-        items = []
-        if isinstance(data, dict):
-            items = data.get("members") or []
+        if not isinstance(data, dict):
+            # 上游失败：不缓存空结果，尽量复用过期缓存，避免 60s 空缓存污染。
+            if cached:
+                return cached[1]
+            return []
+        items = data.get("members") or []
         members = []
+        raw_items: list[dict] = []
         for item in items:
             if not isinstance(item, dict):
                 continue
+            raw_items.append(item)
             members.append(
                 MessageMember(
                     user_id=str(item.get("wxid") or ""),
@@ -244,27 +258,32 @@ class FlowBotPlatform(Platform):
                     ),
                 )
             )
-        self._member_cache[group_id] = (now, members)
+        self._member_cache[group_id] = (now, members, raw_items)
         return members
 
-    async def get_member_avatar_url(self, group_id: str, user_id: str) -> str | None:
-        """查询群成员头像 URL（GET /api/v1/group-members 的 avatarUrl 字段）。"""
+    async def get_member_avatar_url(
+        self, group_id: str, user_id: str, force_refresh: bool = False
+    ) -> str | None:
+        """查询群成员头像 URL（GET /api/v1/group-members 的 avatarUrl 字段）。
+
+        复用 get_member_list 缓存的原始 member dict，命中 TTL 内不再重复请求接口。
+        force_refresh=True 时强制刷新（某成员头像在群内但缓存缺失时排查用）。
+        """
         now = time.time()
         cached = self._member_cache.get(group_id)
-        items = None
-        if cached and now - cached[0] < _MEMBERS_TTL:
-            items = getattr(cached[1], "_raw", None)
+        items: list[dict] | None = None
+        if not force_refresh and cached and now - cached[0] < _MEMBERS_TTL:
+            items = cached[2]
         if items is None:
-            url = f"/api/v1/group-members?chatroomId={quote(group_id)}&forceRefresh=0"
-            data = await self._api_json("GET", url)
-            if isinstance(data, dict):
-                items = data.get("members") or []
+            await self.get_member_list(group_id, force_refresh=force_refresh)
+            refreshed = self._member_cache.get(group_id)
+            items = refreshed[2] if refreshed else None
         if not items:
             return None
         for item in items:
             if not isinstance(item, dict):
                 continue
-            if str(item.get("wxid") or "") == str(user_id):
+            if _wxid_match(str(item.get("wxid") or ""), user_id):
                 return str(item.get("avatarUrl") or "") or None
         return None
 
@@ -272,7 +291,7 @@ class FlowBotPlatform(Platform):
         """查询单个群成员信息（从成员列表缓存中匹配）。"""
         members = await self.get_member_list(group_id)
         for m in members:
-            if m.user_id == user_id:
+            if _wxid_match(m.user_id, user_id):
                 return m
         return None
 
@@ -1139,6 +1158,23 @@ def _looks_like_base64(s: str) -> bool:
     if not s or len(s) % 4 != 0:
         return False
     return all(c in _B64_CHARSET for c in s)
+
+
+def _wxid_match(a: str, b: str) -> bool:
+    """归一化比较微信 wxid，容忍「wxid_」前缀与大小写差异。
+
+    FlowBot `/api/v1/group-members` 返回的 `wxid` 恒带 `wxid_` 前缀
+    （如 wxid_kbwhoagqmspj21），而消息事件侧的 sender_id 可能带/去前缀
+    （kbwhoagqmspj21 或 wxid_kbwhoagqmspj21）。严格相等会导致头像/昵称
+    匹配失败、退化为显示原始 wxid。此处剥离前缀并用小写比较，使两种形态互认。
+    """
+    na = str(a or "").strip().lower()
+    nb = str(b or "").strip().lower()
+    if na.startswith("wxid_"):
+        na = na[len("wxid_"):]
+    if nb.startswith("wxid_"):
+        nb = nb[len("wxid_"):]
+    return bool(na) and na == nb
 
 
 def _mask_host(base: str) -> str:

@@ -2,6 +2,19 @@
 
 本插件所有版本更新记录。版本遵循语义化版本（`vMAJOR.MINOR.PATCH`）。
 
+## v1.2.7 — 2026-08-19
+
+### 修复（成员缓存：头像查询死代码 + 缓存通道失效）
+- **`get_member_avatar_url` 缓存失效死代码**：原实现 `getattr(cached[1], "_raw", None)` 中的 `_raw` 从未被写入（缓存值是无该属性的 `MessageMember` 列表），导致**每次头像查询都绕过 60s 缓存重复请求 `/api/v1/group-members`**。现改为在 `get_member_list` 落缓存时同步保留原始 member dict（`group_id -> (fetched_at, members, raw_items)`），`get_member_avatar_url` 复用同一份请求结果命中 `avatarUrl`，命中 TTL 内不再重复请求。
+- **上游失败不污染缓存**：`Get /group-members` 失败（`_api_json` 返回 `None`，如 401/4xx/5xx/网络异常）时不再写入空缓存，回退返回过期的已缓存成员，避免一次短暂接口故障导致整组成员"无昵称/无头像"长达 60s（该故障在头像查询真正服用缓存后才可被观察到）。
+- **wxid 匹配归一化**：`get_member_avatar_url`/`get_member_info` 改用 `_wxid_match`（剥离 `wxid_` 前缀 + 小写比较）匹配成员。FlowBot `group-members` 返回的 `wxid` 恒带 `wxid_` 前缀（如 `wxid_kbwhoagqmspj21`），而消息侧 `sender_id` 可能带/去前缀，严格相等会导致头像/昵称匹配失败、退化为显示原始 wxid。
+
+### 新增
+- **`force_refresh` 逃生通道**：`get_member_list(group_id, force_refresh=True)` 与 `get_member_avatar_url(..., force_refresh=True)` 可强制绕过 TTL 刷新，供调用方（如日报插件）在成员缺失昵称/头像时自救。
+
+### 说明
+- 契约不变：昵称仍优先 `displayName`/`groupNickname`/`nickname`，头像取 `avatarUrl`，二者均按 `wxid` 对齐；`get_member_info`/`get_member_list` 签名新增可选参数，向后兼容。
+
 ## v1.2.6 — 2026-08-14
 
 ### 变更（对齐 flowbot 5MB 硬上限）
