@@ -1,6 +1,6 @@
 name: astrbot_plugin_flowbot_adapter
 display_name: FlowBot适配器
 desc: FlowBot 适配器，通过 FlowBot Docker WebUI 统一端口（WS 入站 + HTTP 出站）连接Weixin聊天。
-version: v1.2.7
+version: v1.3.1
 author: unsuited_
 repo: https://github.com/SteveBaka/astrbot_plugin_flowbot_adapter

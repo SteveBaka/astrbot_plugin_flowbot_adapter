@@ -2,6 +2,34 @@
 
 本插件所有版本更新记录。版本遵循语义化版本（`vMAJOR.MINOR.PATCH`）。
 
+## v1.3.1 — 2026-08-22
+
+### 新增（视频链路统一：upload token / media_path 第三分支）
+- **`_send_video` 三分支重构**：
+  1. **本地文件**（`os.path.isfile`）→ `_upload_media(kind="video")` 上传 → `media_path` 引用 FlowBot 落盘产物（`/tmp/weflow_uploads/<token><ext>`）。
+  2. **http(s) 直链** → `video_url`（FlowBot 自行下载）。
+  3. **base64 源**（`base64://`/`data:`/裸 base64）→ ≤ `flowbot_video_size_threshold`(14MB) → `video_base64`，否则跳过。
+- 修复此前「本地大文件（如 44MB）无 http 直链又被 14MB base64 阈值拒绝 → 直接跳过」的链路缺口：现本地文件统一走上传通道。
+- **`_upload_media` 扩展**：支持 `kind`（`image`/`video`）、`source_url`（`<kind>_url` 提交），返回 `{"token","path"}` dict（此前仅返回 str token）。
+
+### 已知遗留
+- 超 FlowBot upload body 上限（20MB）的本地文件上传仍会失败（如 44.71MB 视频），告警记录、待 FlowBot 侧 upload 通道扩容后打通。
+
+## v1.3.0 — 2026-08-21
+
+### 新增（视频发送支持，对齐 FlowBot VIDEO-SEND-DESIGN §六）
+- **`_send_video`**：新增视频/文件发送方法，`POST /api/v1/messages/send type=video`。≤ `flowbot_video_size_threshold`（默认14MB）走 `video_base64` 直传，超过走 `video_url` 直链由 FlowBot 下载；支持本地文件（`os.path.isfile` 校验后读文件转 base64）、`base64://`/`data:`/裸 base64、http(s) 直链三类来源。与 `_send_image` 同构，全函数 try/except（旧版 FlowBot 400 → 告警日志，不炸消息循环）。
+- **`_send_to_session` 分发**：`Video` 组件自动发出；`File` 组件由原"日志丢弃"升级为复用视频通道（微信端同为粘贴）。
+- **能力声明**：`capabilities()` 的 `supports_video`/`supports_file` 置 `True`；`supports_voice` 保持 `False`。
+- **第三方钩子**：新增 `send_video(session_id, video)`（对齐 `send_text`/`send_image` 暴露模式）。
+- **helper**：新增 `_extract_base64(source)` 与 `_normalize_video_url(url)`（复用 `_fix_image_url` 容器地址改写）。
+- **新配置**：`flowbot_video_size_threshold`(14MB) / `flowbot_video_use_direct_url`(true)。
+
+### 说明
+- 双端设计参考：`docs/dev/ADAPTER-VIDEO-UPDATE.md`（适配器侧）与 FlowBot `docs/dev/VIDEO-SEND-DESIGN.md` §五.7、§六。
+- v1.3.1 起已实现 `media_path`/upload token 分支（本地文件统一走上传通道，见 v1.3.1 条目）；`Record`（语音）仍不支持。
+- 平台适配器升级：需完全重启 AstrBot 使新 FlowBot 连接实例生效（reload 不替换运行中实例）。
+
 ## v1.2.7 — 2026-08-19
 
 ### 修复（成员缓存：头像查询死代码 + 缓存通道失效）

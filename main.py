@@ -39,6 +39,7 @@ from astrbot.api.message_components import (
     Image,
     Plain,
     Reply,
+    Video,
 )
 from astrbot.api.platform import (
     AstrBotMessage,
@@ -78,6 +79,8 @@ _MEMBERS_TTL = 60  # 群成员缓存 TTL（秒）
         "flowbot_reconnect_max_attempts": _DEFAULT_MAX_RECONNECT_ATTEMPTS,
         "flowbot_use_direct_url": False,
         "flowbot_image_size_threshold": 5,
+        "flowbot_video_size_threshold": 14,
+        "flowbot_video_use_direct_url": True,
     },
     config_metadata={
         "flowbot_host": {
@@ -115,6 +118,16 @@ _MEMBERS_TTL = 60  # 群成员缓存 TTL（秒）
             "description": "图片 base64 阈值（MB）",
             "type": "int",
             "hint": "超过该大小的图片不再用 base64 直发（避免微信粘贴大图冻结），改为透传 URL 或尝试上传获取 token。默认 5；下载/上传硬上限 10MB",
+        },
+        "flowbot_video_size_threshold": {
+            "description": "视频文件 base64 阈值（MB）",
+            "type": "int",
+            "hint": "≤该大小的视频以 video_base64 直传；超过则以 video_url 直链由 FlowBot 下载。默认 14（对齐 FlowBot 20MB body ÷ 1.33）；上限约 100MB",
+        },
+        "flowbot_video_use_direct_url": {
+            "description": "视频直链优先",
+            "type": "bool",
+            "hint": "与图片相反：视频默认走直链（大、更稳）。开启后优先透传 video_url，失败回退 base64",
         },
     },
 )
@@ -742,9 +755,9 @@ class FlowBotPlatform(Platform):
             "platform": "flowbot_adapter",
             "supports_text": True,
             "supports_image": True,
-            "supports_file": False,  # flowbot Linux 容器不支持文件发送
+            "supports_file": True,  # flowbot Linux 容器经 type=video 通道发送文件/视频
             "supports_voice": False,
-            "supports_video": False,
+            "supports_video": True,
             "supports_at": True,
             "supports_reply": True,
             "supports_group": True,
@@ -785,6 +798,15 @@ class FlowBotPlatform(Platform):
         if isinstance(image, str):
             image = Image(file=image)
         await self._send_image(session_id, image, None)
+        return True
+
+    async def send_video(
+        self, session_id: str, video: Video | str
+    ) -> bool:
+        """便捷视频发送（第三方插件调用）。video 可为 Video 组件或路径/URL/base64 字符串。"""
+        if isinstance(video, str):
+            video = Video(file=video)
+        await self._send_video(session_id, video)
         return True
 
     async def send_message_chain(
@@ -829,12 +851,13 @@ class FlowBotPlatform(Platform):
                 reply_to = str(comp.id or "")
             elif isinstance(comp, Image):
                 images.append(comp)
+            elif isinstance(comp, Video):
+                await self._send_video(session_id, comp)
+                self._mark_sent(session_id, "")
             elif isinstance(comp, File):
-                # flowbot Linux 容器不支持文件发送（仅 text/image），记录降级日志便于排查
-                logger.warning(
-                    f"FlowBot 不支持文件发送，已忽略 (session={session_id}, "
-                    f"name={getattr(comp, 'name', '') or ''})"
-                )
+                # flowbot Linux 容器经 type=video 通道发送文件/视频（微信端同为粘贴）
+                await self._send_video(session_id, comp)
+                self._mark_sent(session_id, "")
 
         text = "".join(text_parts).strip()
         if text:
@@ -1030,16 +1053,174 @@ class FlowBotPlatform(Platform):
                     pass
                 self._forget_temp_file(downloaded_path)
 
-    async def _upload_media(
-        self, local_path: str | None = None, b64: str | None = None
-    ) -> str | None:
-        """上传媒体到 FlowBot，返回 image_token；失败返回 None。
+    @staticmethod
+    def _extract_base64(source: str) -> str:
+        """从图片/视频源提取裸 base64 串。
 
-        FlowBot /api/v1/media/upload 只接受 JSON body（parseBody 仅 JSON.parse），
-        不接收 multipart/form-data，故以 {"image_base64": ...} 提交。
-        支持 local_path（读文件转 base64）或直接传 b64 字符串两种来源。
+        支持 `base64://`、`data:image/...;base64,`、以及裸 base64（经
+        `_looks_like_base64` 保守判定，避免误伤路径/URL）。非 base64 源返回空串。
         """
-        if not b64:
+        candidate = str(source or "").strip()
+        if not candidate:
+            return ""
+        if candidate.startswith("base64://"):
+            return candidate[len("base64://"):].strip()
+        if candidate.startswith("data:") and "," in candidate:
+            return candidate.split(",", 1)[-1].strip()
+        if _looks_like_base64(candidate):
+            return candidate.strip()
+        return ""
+
+    def _normalize_video_url(self, url: str) -> str:
+        """视频直链归一：仿图片 `_fix_image_url`，将容器内 127.0.0.1 地址改写为宿主机可达。
+
+        非 http(s) 源返回空串（表示无可用直链）。
+        """
+        candidate = str(url or "").strip()
+        if not candidate:
+            return ""
+        if not candidate.startswith("http"):
+            return ""
+        return self._fix_image_url(candidate)
+
+    async def _send_video(self, session_id: str, comp) -> None:
+        """发送视频/文件组件 → FlowBot /api/v1/messages/send type=video。
+
+        三通道统一（v1.3.1）：
+        1. 本地文件（os.path.isfile）→ _upload_media 上传 → media_path 引用
+           FlowBot 落盘产物（/tmp/weflow_uploads/<token><ext>）。
+        2. http(s) 直链 → video_url，由 FlowBot 自行下载。
+        3. base64 源（base64:// / data: / 裸 base64）→ 若
+           ≤ flowbot_video_size_threshold(默认14MB) 则 video_base64 直传，否则跳过。
+        全函数 try/except：旧版 FlowBot 400 / 上传失败均仅告警，不炸消息循环。
+        """
+        try:
+            def _pick(candidates):
+                for c in candidates:
+                    if c:
+                        return c
+                return ""
+
+            def _strip_file_uri(val: str) -> str:
+                if val.startswith("file:///"):
+                    return val[len("file:///"):].strip()
+                return val
+
+            comp_file = str(getattr(comp, "file", None) or "").strip()
+            comp_url = str(getattr(comp, "url", None) or "").strip()
+            comp_path = str(getattr(comp, "path", None) or "").strip()
+
+            # 死路径防御：剥 file:/// 前缀；本地文件存在时才读作真实来源
+            stripped = [_strip_file_uri(v) for v in (comp_file, comp_url, comp_path)]
+            _fetch = []
+            for s in stripped:
+                if s.startswith("http") or _looks_like_base64(s):
+                    _fetch.append(s)
+                elif s.startswith("base64://") or (s.startswith("data:") and "," in s):
+                    _fetch.append(s)
+                elif s and os.path.isfile(s):
+                    _fetch.append(s)
+            source = _pick(tuple(_fetch))
+            if not source:
+                logger.warning(
+                    "[FlowBot] 视频组件无可用来源，已忽略 (session=%s)", session_id
+                )
+                return
+
+            payload: dict = {"session_id": session_id, "type": "video"}
+
+            try:
+                threshold_mb = max(
+                    1, int(self.config.get("flowbot_video_size_threshold", 14) or 14)
+                )
+            except (TypeError, ValueError):
+                threshold_mb = 14
+            threshold_bytes = threshold_mb * 1024 * 1024
+
+            is_existing_file = source and not source.startswith("http") and (
+                os.path.isfile(source)
+            )
+
+            if is_existing_file:
+                # 本地文件视频：upload token 通道（统一大文件/小文件链路）。
+                # 上传后以 media_path 引用 flowbot 侧落盘产物（/tmp/weflow_uploads/<token><ext>）。
+                try:
+                    up = await self._upload_media(
+                        local_path=source, kind="video"
+                    )
+                except Exception as e:
+                    logger.warning(
+                        f"[FlowBot] 视频上传异常 (session={session_id}): {e}"
+                    )
+                    up = None
+                if not up:
+                    logger.warning(
+                        "[FlowBot] 视频上传失败或无 token，已忽略 "
+                        "(session=%s, file=%s)",
+                        session_id, source,
+                    )
+                    return
+                token = str(up.get("token") or "").strip()
+                up_path = str(up.get("path") or "").strip()
+                if up_path:
+                    media_path = up_path
+                elif token:
+                    ext = ""
+                    lower_src = source.lower()
+                    for cand_ext in (".mp4", ".mkv", ".webm", ".mov", ".flv"):
+                        if lower_src.endswith(cand_ext):
+                            ext = cand_ext
+                            break
+                    media_path = f"/tmp/weflow_uploads/{token}{ext}"
+                else:
+                    logger.warning(
+                        "[FlowBot] 视频上传响应无 token/path，已忽略 "
+                        "(session=%s)", session_id,
+                    )
+                    return
+                payload["media_path"] = media_path
+            elif source.startswith("http"):
+                # http(s) 直链：video_url，由 FlowBot 自行下载
+                payload["video_url"] = self._normalize_video_url(source)
+            else:
+                # base64 源（base64:// / data: / 裸 base64）：≤阈值内联
+                b64 = self._extract_base64(source)
+                if b64 and len(b64) * 3 // 4 <= threshold_bytes:
+                    payload["video_base64"] = b64
+                else:
+                    logger.warning(
+                        "[FlowBot] 视频发送跳过: base64 源超阈值(%dMB) "
+                        "且无 URL/本地文件 (session=%s)",
+                        threshold_mb, session_id,
+                    )
+                    return
+
+            await self._api_json("POST", "/api/v1/messages/send", payload)
+            self._stats["sent"] += 1
+            logger.info(f"FlowBot video -> {session_id}")
+        except Exception as e:
+            logger.warning("[FlowBot] 视频发送失败（FlowBot 版本过低或网络异常）: %s", e)
+
+    async def _upload_media(
+        self,
+        local_path: str | None = None,
+        b64: str | None = None,
+        kind: str = "image",
+        source_url: str | None = None,
+    ) -> dict | None:
+        """上传媒体到 FlowBot /api/v1/media/upload，返回解析结果 dict。
+
+        FlowBot upload 只接受 JSON body（parseBody 仅 JSON.parse），不接收
+        multipart/form-data。来源二选一：
+        - local_path：读文件转 base64 提交（`<kind>_base64`）
+        - b64：直接以 `<kind>_base64` 提交
+        - source_url：以 `<kind>_url` 提交（让 FlowBot 侧自行下载）
+
+        成功返回 {"token": 字段, "path": 落盘路径字段}；失败返回 None。
+        FlowBot 落盘沿用 `/tmp/weflow_uploads/<token><ext>` 模式，token 可
+        用于 media_path 引用。
+        """
+        if not b64 and not source_url:
             if not local_path:
                 return None
             try:
@@ -1051,11 +1232,17 @@ class FlowBotPlatform(Platform):
         http = await self._ensure_http()
         url = f"{self._webui_base}/api/v1/media/upload"
         try:
-            payload = {"image_base64": b64}
+            payload: dict = {}
+            if source_url:
+                payload[f"{kind}_url"] = source_url
+            else:
+                payload[f"{kind}_base64"] = b64
             async with http.post(url, json=payload) as resp:
                 text = await resp.text()
                 if resp.status >= 400:
-                    logger.warning(f"FlowBot 媒体上传失败 {resp.status}: {text[:200]}")
+                    logger.warning(
+                        f"FlowBot 媒体上传失败 {resp.status}: {text[:200]}"
+                    )
                     return None
                 result = await _parse_json(text)
                 if isinstance(result, dict):
@@ -1063,12 +1250,20 @@ class FlowBotPlatform(Platform):
                     for container in (inner, result):
                         if not isinstance(container, dict):
                             continue
-                        # flowbot 契约确认：返回字段为 token
+                        token = ""
+                        path = ""
                         for k in ("token", "image_token", "file_token", "media_id"):
                             if container.get(k):
-                                return str(container[k])
+                                token = str(container[k])
+                                break
+                        for k in ("path", "filePath", "mediaPath", "url"):
+                            if container.get(k):
+                                path = str(container[k])
+                                break
+                        if token or path:
+                            return {"token": token, "path": path}
                     if isinstance(inner, str) and inner:
-                        return inner
+                        return {"token": inner, "path": ""}
             return None
         except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as e:
             logger.warning(f"FlowBot 媒体上传异常: {e}")
