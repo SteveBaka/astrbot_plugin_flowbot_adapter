@@ -23,7 +23,7 @@ FlowBot 平台适配器：通过 **FlowBot Docker WebUI 统一端口**连接微�
 |------|------|--------|------|
 | `flowbot_host` | string | 空 | FlowBot WebUI 主机地址（FlowBot 容器 IP）|
 | `flowbot_port` | int | `7400` | FlowBot 插件 API 端口（注意：7300 是 WebUI 需登录，API Key 无效）|
-| `flowbot_api_key` | string | 空 | FlowBot WebUI API Key（Docker 环境变量 `weflow_webui_api_key` 的值）|
+| `flowbot_api_key` | string | 空 | FlowBot Bot Token（WebUI 中插件模式 Bot 配置的 Token，创建 Bot 时自动生成；与 WebUI 登录密码无关）|
 | `flowbot_reconnect_interval` | int | `5` | 断线重连初始间隔（秒），指数退避，上限 60s |
 | `flowbot_reconnect_max_attempts` | int | `5` | 断线重连最大次数，超过即停止（避免影响性能与日志）；填 0 表示不限制 |
 | `flowbot_use_direct_url` | bool | `false` | 允许透传图片 URL 而非下载 base64（省流量），发送失败自动回退 base64 |
@@ -85,7 +85,7 @@ avatar = await platform.get_member_avatar_url(groups[0].group_id, "wxid_xxx")
 
 1. **网络链路**：AstrBot 所在机器必须能访问 FlowBot 插件 API 端口（Docker 需 `-p 7400:7400` 映射；若同时用 WebUI 再映射 7300）。
 2. **图片回显**：发送图片后，若对端推送的回显消息与发送内容一致，已通过短时去重抑制 ping-pong。
-3. **API Key 认证**：Docker 部署时需确保设置 `weflow_webui_api_key`，否则 HTTP/WS 均返回 401。
+3. **API Key 认证**：插件 API 认证使用 FlowBot WebUI 中 Bot 配置的 Token（创建 Bot 时自动生成，非 WebUI 登录密码，容器也无 `weflow_webui_api_key` 环境变量）。适配器 `flowbot_api_key` 需填写同一 Token，不匹配或为空时 HTTP/WS 均返回 401。
 4. **消息去重**：内置 10 分钟 message_id 去重，防止重复回调。
 5. **跨主机图片**：AstrBot 与 FlowBot 分机部署时，本机临时文件路径对 FlowBot 不可见，依赖 base64/URL 传输。
 

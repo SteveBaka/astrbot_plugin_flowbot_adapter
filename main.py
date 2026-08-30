@@ -94,9 +94,9 @@ _MEMBERS_TTL = 60  # 群成员缓存 TTL（秒）
             "hint": "FlowBot 插件 API 端口，默认 7400（注意：7300 是 WebUI 需登录，API Key 无效）",
         },
         "flowbot_api_key": {
-            "description": "FlowBot WebUI API Key",
+            "description": "FlowBot Bot Token",
             "type": "string",
-            "hint": "Docker 环境变量 weflow_webui_api_key 的值",
+            "hint": "FlowBot WebUI 中插件模式 Bot 配置的 Token（创建 Bot 时自动生成），与 WebUI 登录密码无关",
             "secret": True,
         },
         "flowbot_reconnect_interval": {
@@ -859,7 +859,9 @@ class FlowBotPlatform(Platform):
                 await self._send_video(session_id, comp)
                 self._mark_sent(session_id, "")
 
-        text = "".join(text_parts).strip()
+        # 多个 Plain 组件以换行合并：保持"上下段"视觉结构，兜底防止
+        # 上游（如分段插件）产出的多段文本在 flowbot 端被粘连成无分隔长串
+        text = "\n".join(text_parts).strip()
         if text:
             # 有正文 → 携带 at_users 发送（flowbot 端渲染真实 @）
             await self._send_text(session_id, text, at_users, reply_to)
