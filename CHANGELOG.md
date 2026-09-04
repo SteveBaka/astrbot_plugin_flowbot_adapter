@@ -2,6 +2,47 @@
 
 本插件所有版本更新记录。版本遵循语义化版本（`vMAJOR.MINOR.PATCH`）。
 
+## v1.4.0 — 2026-09-04
+
+> 合并 v1.4.0/v1.4.1/v1.5.0 三轮未发布的开发迭代，对齐 FlowBot
+> `docs/dev/ADAPTER-MEDIA-CONTRACT.md`（2026-09-03/04 版契约）。
+
+### 新增：入站视频推送
+- `convert_message` 新增 `type == 'video'` 分支（`_normalize_inbound_video`），
+  按契约行为矩阵三档降级：视频本体（`video_url` 下载 → `Video` 组件，封面挂
+  `cover`）/ 封面降级段（`fileMissing` 时封面图 + 文本标注）/ `[视频]` 文本占位。
+- 流式落盘下载（上限 100MB 对齐 `videoMaxBytes`，120s 超时），独立临时文件池
+  （10 个上限 + 30 分钟 TTL），不占用图片池。
+- FlowBot 侧开关：`inboundVideoPushEnabled`（默认关，关闭时零影响）。
+
+### 新增：入站语音推送
+- `convert_message` 新增 `type == 'voice'` 分支（`_normalize_inbound_voice`），
+  两档行为：WAV 下载（HEAD 预检体积 + 10MB 闸 + 60s 超时）→ `Record` 组件
+  （转写/ASR 由 astrbot 管线自理）/ 带时长的文本占位 `[语音(Ns)]`。
+- FlowBot 侧交付 WAV（24kHz/16bit/mono，silk 解码内置，零转写），token 直链
+  TTL 1h 且支持 Range/HEAD。FlowBot 侧开关：`inboundVoicePushEnabled`（默认关）。
+
+### 新增：引用回复唤醒
+- 推送携带 `quoted_*` 五字段时构造 AstrBot `Reply` 组件（components[0]）：
+  `quoted_is_self=true` 时 `sender_id` 钉死为 `self_id`——群聊引用 bot 消息
+  无需 @ 直接唤醒（`Reply.sender_id == self_id` 等式）；引用他人原样透传不唤醒。
+  LLM 上下文经 astrbot 内置渲染为 `[Quote(昵称: 原文)]`。
+
+### 修复
+- **多段文本粘连**：`_send_to_session` 中多个 `Plain` 组件由无分隔 `"".join`
+  改为 `"\n".join`——上游分段插件产出的多段文本不再被粘连成无换行长串。
+- **Reply.qq pydantic 校验崩溃**：astrbot v4.27.4 的 `Reply.qq` 为
+  `int | None`，传 wxid 字符串会导致整条消息被丢弃；移除该 deprecated 字段
+  传参，并为 `Reply` 构造增加异常防御（构造失败降级为无引用文本，不丢消息）。
+
+### 变更
+- 配置说明修正：`flowbot_api_key` 实为 FlowBot WebUI 中插件模式 Bot 配置的
+  Token（创建 Bot 时自动生成），与 WebUI 登录密码无关；容器无
+  `weflow_webui_api_key` 环境变量（历史文档笔误）。
+- `handle_msg` 事件周期临时文件登记从仅 `Image` 扩展到 `Image` + `Record`。
+- 依赖：入站视频/语音需 FlowBot ≥ 1.5.x 契约（`ADAPTER-MEDIA-CONTRACT.md`），
+  开关默认关；旧版 FlowBot 或开关关闭时行为与 v1.3.x 逐字节一致（向后兼容）。
+
 ## v1.3.1 — 2026-08-22
 
 ### 新增（视频链路统一：upload token / media_path 第三分支）

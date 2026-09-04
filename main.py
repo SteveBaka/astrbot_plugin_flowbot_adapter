@@ -38,6 +38,7 @@ from astrbot.api.message_components import (
     File,
     Image,
     Plain,
+    Record,
     Reply,
     Video,
 )
@@ -60,6 +61,14 @@ _RECENT_SEND_TTL = 3
 _MAX_DOWNLOAD_BYTES = 5 * 1024 * 1024  # 单次图片下载大小上限 5MB（flowbot 硬上限）
 _WS_PING_INTERVAL = 30  # WebSocket 心跳间隔（秒），用于检测半开连接
 _MAX_TEMP_FILES = 100  # 本地临时文件追踪上限，超出清理最旧，防止无限膨胀
+
+# ── 入站媒体下载常量（视频/语音，FlowBot videoMaxBytes/voiceMaxBytes 对齐） ──
+_MAX_VIDEO_DOWNLOAD_BYTES = 100 * 1024 * 1024
+_VIDEO_DOWNLOAD_TIMEOUT = 120
+_MAX_VIDEO_TEMP_FILES = 10  # 视频临时文件独立上限（单文件可达百 MB，从严）
+_VIDEO_TEMP_TTL = 1800
+_MAX_VOICE_DOWNLOAD_BYTES = 10 * 1024 * 1024
+_VOICE_DOWNLOAD_TIMEOUT = 60
 _BARE_B64_MIN_LEN = 64  # 裸 base64 识别的最小长度阈值，避免误伤短路径/URL
 _B64_CHARSET = set(
     "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/="
@@ -168,6 +177,7 @@ class FlowBotPlatform(Platform):
         self._sessions_cache: dict[str, dict] = {}
         self._MAX_SESSIONS_CACHE = 2000
         self._temp_files: dict[str, float] = {}  # path -> mtime，用于容量清理
+        self._video_temp_files: dict[str, float] = {}  # 入站视频临时文件（独立短 TTL）
         self._stats = {"recv": 0, "sent": 0}
         # 按需懒加载缓存：key -> (fetched_at, value)
         self._group_cache: dict[str, tuple[float, list]] = {}
@@ -551,6 +561,10 @@ class FlowBotPlatform(Platform):
         components = []
         if mtype == "image":
             components.append(await self._normalize_inbound_image(data, text))
+        elif mtype == "video":
+            components.extend(await self._normalize_inbound_video(data, text))
+        elif mtype == "voice":
+            components.extend(await self._normalize_inbound_voice(data, text))
         elif mtype == "emoji":
             emoji_url = data.get("emoji_url") or ""
             local = (
@@ -578,15 +592,36 @@ class FlowBotPlatform(Platform):
                     0,
                     At(qq=abm.self_id, name=str(data.get("group_name") or "")),
                 )
+
+        # 引用回复：is_self 时 sender_id 钉死为 self_id（触发无 @ 唤醒），他人原样透传
+        quoted_sender_id = str(data.get("quoted_sender_id") or "")
+        quoted_svrid = str(data.get("quoted_svrid") or "")
+        if quoted_sender_id or quoted_svrid:
+            quoted_is_self = bool(abm.self_id) and bool(data.get("quoted_is_self"))
+            reply_sender_id = abm.self_id if quoted_is_self else quoted_sender_id
+            reply_sender_name = str(data.get("quoted_sender_name") or "")
+            reply_text = str(data.get("quoted_content") or "")
+            try:
+                # qq 字段为 int 校验（v4.27.4），wxid 字符串不可传
+                components.insert(
+                    0,
+                    Reply(
+                        id=quoted_svrid,
+                        chain=[Plain(text=reply_text)] if reply_text else [],
+                        sender_id=reply_sender_id,
+                        sender_nickname=reply_sender_name,
+                        message_str=reply_text,
+                        text=reply_text,  # deprecated 兼容字段
+                    ),
+                )
+            except Exception as e:
+                # 版本差异防御：Reply 构造失败只降级为无引用文本，不丢消息
+                logger.warning(f"FlowBot Reply 组件构造失败，降级为无引用文本: {e}")
         abm.message = components
         return abm
 
     async def _normalize_inbound_image(self, data: dict, text: str):
-        """入站图片源归一化：支持 base64://、data:、裸 base64、http(s)、本地路径。
-
-        base64 形态直接构造 Image(file=base64://...)，不落盘，省空间；
-        仅 http(s) URL 与本地路径才下载/透传。
-        """
+        """入站图片源归一化：base64://、data:、裸 base64、http(s)、本地路径。"""
         url = str(data.get("image_url") or "")
         base64_src = str(data.get("image_base64") or "")
         content = str(data.get("content") or "")
@@ -628,6 +663,194 @@ class FlowBotPlatform(Platform):
         # 6. 兜底：文本占位
         return Plain(text=f"[图片] {text}")
 
+    async def _normalize_inbound_video(self, data: dict, text: str) -> list:
+        """入站视频三档降级：视频本体 / 封面降级段（fileMissing）/ [视频] 占位。
+
+        契约与字段语义见 FlowBot ADAPTER-MEDIA-CONTRACT §5.2/§5.3。"""
+        video_url = str(data.get("video_url") or "")
+        poster_url = str(data.get("video_poster_url") or "")
+        meta = data.get("video_meta") or {}
+        file_missing = bool(meta.get("fileMissing"))
+
+        # 1. 视频本体：立即下载（token 1h 可重复，但尽早消费避免池淘汰/过期）
+        if video_url and not file_missing:
+            local = await self._download_video(video_url)
+            if local:
+                comp = Video(file=local)
+                if poster_url:
+                    poster = await self._download_image(poster_url)
+                    if poster:
+                        try:
+                            comp.cover = poster
+                        except Exception:
+                            pass
+                return [comp]
+            logger.warning(
+                f"FlowBot 入站视频下载失败，降级封面/占位: {video_url[:120]}"
+            )
+
+        # 2. 封面降级段（对齐 OneBot 通道行为矩阵：视频缺失但有封面）
+        if poster_url:
+            poster = await self._download_image(poster_url)
+            if poster:
+                return [
+                    Image(file=poster),
+                    Plain(text="（以上为视频封面截图，视频文件未下载）"),
+                ]
+
+        # 3. 兜底：与开关关闭时逐字一致的文本占位
+        return [Plain(text=text or "[视频]")]
+
+    async def _download_video(self, url: str) -> str | None:
+        """流式下载入站视频（上限 100MB、120s 超时），失败返回 None。独立短 TTL 池。"""
+        if not url:
+            return None
+        self._trim_video_temp_files()
+        fd, path = tempfile.mkstemp(suffix=".mp4")
+        try:
+            timeout = aiohttp.ClientTimeout(total=_VIDEO_DOWNLOAD_TIMEOUT)
+            async with aiohttp.ClientSession(timeout=timeout) as sess:
+                async with sess.get(url) as resp:
+                    if resp.status != 200:
+                        logger.warning(
+                            f"视频下载失败 {resp.status}: {url[:120]}"
+                        )
+                        os.close(fd)
+                        os.remove(path)
+                        return None
+                    written = 0
+                    with os.fdopen(fd, "wb") as f:
+                        async for chunk in resp.content.iter_chunked(256 * 1024):
+                            written += len(chunk)
+                            if written > _MAX_VIDEO_DOWNLOAD_BYTES:
+                                logger.warning(
+                                    f"视频下载超过大小上限 "
+                                    f"{_MAX_VIDEO_DOWNLOAD_BYTES}: {url[:120]}"
+                                )
+                                f.close()
+                                os.remove(path)
+                                return None
+                            f.write(chunk)
+            self._video_temp_files[path] = time.time()
+            return path
+        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+            logger.warning(f"视频下载异常: {e}")
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+            self._remove_quiet(path)
+            return None
+        except Exception as e:
+            logger.warning(f"视频下载未知异常: {e}")
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+            self._remove_quiet(path)
+            return None
+
+    def _trim_video_temp_files(self):
+        now = time.time()
+        for p, ts in list(self._video_temp_files.items()):
+            if now - ts > _VIDEO_TEMP_TTL:
+                self._remove_quiet(p)
+                self._video_temp_files.pop(p, None)
+        if len(self._video_temp_files) <= _MAX_VIDEO_TEMP_FILES:
+            return
+        excess = len(self._video_temp_files) - _MAX_VIDEO_TEMP_FILES
+        oldest = sorted(self._video_temp_files.items(), key=lambda kv: kv[1])[:excess]
+        for p, _ in oldest:
+            self._remove_quiet(p)
+            self._video_temp_files.pop(p, None)
+
+    def _remove_quiet(self, path: str):
+        try:
+            if path and os.path.isfile(path):
+                os.remove(path)
+        except OSError:
+            pass
+
+    async def _normalize_inbound_voice(self, data: dict, text: str) -> list:
+        """入站语音两档：WAV 下载 → Record 组件 / 带时长的 [语音] 占位。
+
+        契约与字段语义见 FlowBot ADAPTER-MEDIA-CONTRACT §5.4。"""
+        voice_url = str(data.get("voice_url") or "")
+        duration_sec = data.get("voice_duration_sec")
+        meta = data.get("voice_meta") or {}
+        available = bool(meta.get("available", True))
+
+        # 1. WAV 可得：HEAD 预检体积（/api/media 全链路支持，超限免流式中止）再下载
+        if voice_url and available:
+            local = await self._download_voice(voice_url)
+            if local:
+                try:
+                    return [Record(file=local)]
+                except Exception as e:
+                    # 版本差异防御：Record 构造失败降级为文本占位，不丢消息
+                    logger.warning(f"FlowBot Record 组件构造失败，降级为文本占位: {e}")
+                    self._track_temp_file(local)
+                    return [
+                        Plain(
+                            text=f"[语音({duration_sec}s)]"
+                            if isinstance(duration_sec, (int, float))
+                            else "[语音]"
+                        )
+                    ]
+            logger.warning(f"FlowBot 入站语音下载失败，降级文本占位: {voice_url[:120]}")
+
+        # 2. 兜底：与开关关闭时同构的文本占位（契约 §5.4：文本 + 时长降级）
+        return [
+            Plain(
+                text=f"[语音({duration_sec}s)]"
+                if isinstance(duration_sec, (int, float))
+                else "[语音]"
+            )
+        ]
+
+    async def _download_voice(self, url: str) -> str | None:
+        """下载入站语音 WAV（HEAD 预检体积，上限 10MB、60s 超时），失败返回 None。"""
+        if not url:
+            return None
+        try:
+            timeout = aiohttp.ClientTimeout(total=_VOICE_DOWNLOAD_TIMEOUT)
+            async with aiohttp.ClientSession(timeout=timeout) as sess:
+                async with sess.head(url) as head:
+                    if head.status != 200:
+                        logger.warning(f"语音预检失败 {head.status}: {url[:120]}")
+                        return None
+                    size = int(head.headers.get("Content-Length") or 0)
+                    if size > _MAX_VOICE_DOWNLOAD_BYTES:
+                        logger.warning(
+                            f"语音超过大小上限 {_MAX_VOICE_DOWNLOAD_BYTES}: "
+                            f"{size}B {url[:120]}"
+                        )
+                        return None
+                async with sess.get(url) as resp:
+                    if resp.status != 200:
+                        logger.warning(f"语音下载失败 {resp.status}: {url[:120]}")
+                        return None
+                    chunks: list[bytes] = []
+                    total = 0
+                    async for chunk in resp.content.iter_chunked(64 * 1024):
+                        total += len(chunk)
+                        if total > _MAX_VOICE_DOWNLOAD_BYTES:
+                            logger.warning(
+                                f"语音下载超过大小上限 {_MAX_VOICE_DOWNLOAD_BYTES}: "
+                                f"{url[:120]}"
+                            )
+                            return None
+                        chunks.append(chunk)
+            fd, path = tempfile.mkstemp(suffix=".wav")
+            with os.fdopen(fd, "wb") as f:
+                for chunk in chunks:
+                    f.write(chunk)
+            self._track_temp_file(path)
+            return path
+        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+            logger.warning(f"语音下载异常: {e}")
+            return None
+
     async def handle_msg(self, message: AstrBotMessage):
         event = FlowBotMessageEvent(
             message_str=message.message_str,
@@ -636,16 +859,16 @@ class FlowBotPlatform(Platform):
             session_id=message.session_id,
             platform=self,
         )
-        # 入站：将本适配器下载的临时图片登记到事件周期，事件结束后由 AstrBot 清理
+        # 入站：将本适配器下载的临时图片/语音登记到事件周期，事件结束后由 AstrBot 清理
         for comp in message.message or []:
-            if isinstance(comp, Image):
+            if isinstance(comp, (Image, Record)):
                 file_ref = getattr(comp, "file", None)
                 if file_ref and file_ref in self._temp_files:
                     try:
                         event.track_temporary_local_file(file_ref)
                         self._forget_temp_file(file_ref)
                     except Exception as e:
-                        logger.debug(f"FlowBot 临时图片登记失败: {e}")
+                        logger.debug(f"FlowBot 临时媒体登记失败: {e}")
         self.commit_event(event)
 
     def _fix_image_url(self, url: str) -> str:
@@ -730,6 +953,9 @@ class FlowBotPlatform(Platform):
             except OSError:
                 pass
         self._temp_files.clear()
+        for path in list(self._video_temp_files):
+            self._remove_quiet(path)
+        self._video_temp_files.clear()
 
     # ── 出站：发送 ─────────────────────────────────────────────────────
 
@@ -859,8 +1085,7 @@ class FlowBotPlatform(Platform):
                 await self._send_video(session_id, comp)
                 self._mark_sent(session_id, "")
 
-        # 多个 Plain 组件以换行合并：保持"上下段"视觉结构，兜底防止
-        # 上游（如分段插件）产出的多段文本在 flowbot 端被粘连成无分隔长串
+        # 换行合并：保留上游分段插件产出的段落结构
         text = "\n".join(text_parts).strip()
         if text:
             # 有正文 → 携带 at_users 发送（flowbot 端渲染真实 @）
@@ -1086,16 +1311,8 @@ class FlowBotPlatform(Platform):
         return self._fix_image_url(candidate)
 
     async def _send_video(self, session_id: str, comp) -> None:
-        """发送视频/文件组件 → FlowBot /api/v1/messages/send type=video。
-
-        三通道统一（v1.3.1）：
-        1. 本地文件（os.path.isfile）→ _upload_media 上传 → media_path 引用
-           FlowBot 落盘产物（/tmp/weflow_uploads/<token><ext>）。
-        2. http(s) 直链 → video_url，由 FlowBot 自行下载。
-        3. base64 源（base64:// / data: / 裸 base64）→ 若
-           ≤ flowbot_video_size_threshold(默认14MB) 则 video_base64 直传，否则跳过。
-        全函数 try/except：旧版 FlowBot 400 / 上传失败均仅告警，不炸消息循环。
-        """
+        """发送视频/文件组件：本地文件走 upload token，直链走 video_url，
+        base64 源 ≤ 阈值内联；失败仅告警，不炸消息循环。"""
         try:
             def _pick(candidates):
                 for c in candidates:
@@ -1210,18 +1427,9 @@ class FlowBotPlatform(Platform):
         kind: str = "image",
         source_url: str | None = None,
     ) -> dict | None:
-        """上传媒体到 FlowBot /api/v1/media/upload，返回解析结果 dict。
-
-        FlowBot upload 只接受 JSON body（parseBody 仅 JSON.parse），不接收
-        multipart/form-data。来源二选一：
-        - local_path：读文件转 base64 提交（`<kind>_base64`）
-        - b64：直接以 `<kind>_base64` 提交
-        - source_url：以 `<kind>_url` 提交（让 FlowBot 侧自行下载）
-
-        成功返回 {"token": 字段, "path": 落盘路径字段}；失败返回 None。
-        FlowBot 落盘沿用 `/tmp/weflow_uploads/<token><ext>` 模式，token 可
-        用于 media_path 引用。
-        """
+        """上传媒体到 /api/v1/media/upload（仅 JSON body），成功返回
+        {"token", "path"} 供 media_path 引用；失败返回 None。来源三选一：
+        local_path 读文件转 base64 / b64 直传 / source_url 直链。"""
         if not b64 and not source_url:
             if not local_path:
                 return None

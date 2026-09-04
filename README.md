@@ -28,6 +28,18 @@ FlowBot 平台适配器：通过 **FlowBot Docker WebUI 统一端口**连接微�
 | `flowbot_reconnect_max_attempts` | int | `5` | 断线重连最大次数，超过即停止（避免影响性能与日志）；填 0 表示不限制 |
 | `flowbot_use_direct_url` | bool | `false` | 允许透传图片 URL 而非下载 base64（省流量），发送失败自动回退 base64 |
 | `flowbot_image_size_threshold` | int | `5` | 图片 base64 阈值（MB），超过则透传 URL 或尝试上传 token；避免微信粘贴大图冻结 |
+| `flowbot_video_size_threshold` | int | `14` | 出站视频 base64 阈值（MB），超过走 `video_url` 直链由 FlowBot 下载 |
+| `flowbot_video_use_direct_url` | bool | `true` | 与图片相反：视频默认走直链（大、更稳），失败回退 base64 |
+
+## 入站媒体与引用回复（需 FlowBot ≥ 1.5.x 契约，开关默认关）
+
+| 能力 | 开关（FlowBot WebUI「消息管理」） | 适配器行为 |
+|------|------|------|
+| 入站视频 | `inboundVideoPushEnabled` | `video_url` 下载 → `Video` 组件；文件缺失时降级封面图 + 文本标注 |
+| 入站语音 | `inboundVoicePushEnabled` | `voice_url` 下载 WAV → `Record` 组件；转写/ASR 由 astrbot 配置自理 |
+| 引用回复 | 始终可用 | 引用 bot 消息无 @ 直接唤醒（`Reply.sender_id == self_id`）；引用他人透传不唤醒 |
+
+开关关闭时对应事件退化为纯文本占位（`[视频]` / `[语音]`），与旧版行为逐字节一致。
 
 ## 安装
 
@@ -52,7 +64,7 @@ FlowBot 平台适配器：通过 **FlowBot Docker WebUI 统一端口**连接微�
 from astrbot.api.message_components import MessageChain, Plain
 
 platform = context.get_platform_inst("flowbot_adapter")
-await platform.send_text("25451799968@chatroom", "群分析报告已生成", at_users=["all"])
+await platform.send_text("25543334968@chatroom", "群分析报告已生成", at_users=["all"])
 groups = await platform.get_group_list()
 avatar = await platform.get_member_avatar_url(groups[0].group_id, "wxid_xxx")
 ```
@@ -60,6 +72,9 @@ avatar = await platform.get_member_avatar_url(groups[0].group_id, "wxid_xxx")
 ## 消息能力
 
 - 文本、图片收发（消息时间戳透传 flowbot 推送的真实发送时间）
+- 视频收发（出站三通道：本地文件 upload token / 直链 / base64；入站 token 直链下载）
+- 入站语音（`Record` 组件，WAV 由 FlowBot 解码交付；转写/ASR 由 astrbot 配置自理）
+- 引用回复：引用 bot 消息无 @ 直接唤醒，引用内容渲染为 `[Quote(昵称: 原文)]` 进模型上下文
 - 群聊 / 私聊（会话类型判断，群回复目标为群会话）
 - 群 @ 发送（`at_users`，支持 `FlowBotMention(wxid=...)` 自研组件与 AstrBot 内置 `At(qq=...)` 兼容；`"all"` = @全体）
 - 回复消息（`reply_to`，需对端支持）
@@ -88,7 +103,7 @@ avatar = await platform.get_member_avatar_url(groups[0].group_id, "wxid_xxx")
 3. **API Key 认证**：插件 API 认证使用 FlowBot WebUI 中 Bot 配置的 Token（创建 Bot 时自动生成，非 WebUI 登录密码，容器也无 `weflow_webui_api_key` 环境变量）。适配器 `flowbot_api_key` 需填写同一 Token，不匹配或为空时 HTTP/WS 均返回 401。
 4. **消息去重**：内置 10 分钟 message_id 去重，防止重复回调。
 5. **跨主机图片**：AstrBot 与 FlowBot 分机部署时，本机临时文件路径对 FlowBot 不可见，依赖 base64/URL 传输。
-
+6. **长期实测效果**：由于微信部分字段和接口不一致，所以部分采用的是自研方案，部分插件会存在兼容性不佳的问题，尽请谅解 （。
 ## 开发调试
 
 ```bash
@@ -96,6 +111,3 @@ avatar = await platform.get_member_avatar_url(groups[0].group_id, "wxid_xxx")
 python -m py_compile main.py
 ```
 
-## 后续规划（可选）
-
-- 对接 OneBot v11 协议（FlowBot 自带），作为容错第二通道
