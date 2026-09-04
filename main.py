@@ -2,6 +2,7 @@ import asyncio
 import base64
 import json
 import os
+import re
 import tempfile
 import time
 from collections import deque
@@ -90,6 +91,7 @@ _MEMBERS_TTL = 60  # 群成员缓存 TTL（秒）
         "flowbot_image_size_threshold": 5,
         "flowbot_video_size_threshold": 14,
         "flowbot_video_use_direct_url": True,
+        "flowbot_text_split_enabled": True,
     },
     config_metadata={
         "flowbot_host": {
@@ -137,6 +139,11 @@ _MEMBERS_TTL = 60  # 群成员缓存 TTL（秒）
             "description": "视频直链优先",
             "type": "bool",
             "hint": "与图片相反：视频默认走直链（大、更稳）。开启后优先透传 video_url，失败回退 base64",
+        },
+        "flowbot_text_split_enabled": {
+            "description": "空行分段发送",
+            "type": "bool",
+            "hint": "把正文中的空行（两个及以上换行）视为多条消息分隔符，拆成多次微信消息依次发送（@ 与引用仅挂在第一条）。兼容 outputpro 等分段插件不支持的平台的兜底；默认开",
         },
     },
 )
@@ -1085,12 +1092,18 @@ class FlowBotPlatform(Platform):
                 await self._send_video(session_id, comp)
                 self._mark_sent(session_id, "")
 
-        # 换行合并：保留上游分段插件产出的段落结构
+        # 空行合并 + 分段：多段文本以换行保留段落结构；\n\n 视为多条消息
+        # 分隔符（上游分段插件对非白名单平台不分段时由适配器兜底拆发）
         text = "\n".join(text_parts).strip()
         if text:
-            # 有正文 → 携带 at_users 发送（flowbot 端渲染真实 @）
-            await self._send_text(session_id, text, at_users, reply_to)
-            self._mark_sent(session_id, text)
+            segments = [text]
+            if bool(self.config.get("flowbot_text_split_enabled", True)):
+                segments = [s.strip() for s in re.split(r"\n{2,}", text) if s.strip()]
+            for i, seg in enumerate(segments):
+                seg_at = at_users if i == 0 else []
+                seg_reply = reply_to if i == 0 else None
+                await self._send_text(session_id, seg, seg_at, seg_reply)
+                self._mark_sent(session_id, seg)
         elif at_users and not images:
             # 纯 @ 无正文：无内容可发，跳过（避免 flowbot 400 Missing content）
             logger.debug(f"FlowBot 跳过空正文 @ 消息 (session={session_id})")

@@ -30,6 +30,7 @@ FlowBot 平台适配器：通过 **FlowBot Docker WebUI 统一端口**连接微�
 | `flowbot_image_size_threshold` | int | `5` | 图片 base64 阈值（MB），超过则透传 URL 或尝试上传 token；避免微信粘贴大图冻结 |
 | `flowbot_video_size_threshold` | int | `14` | 出站视频 base64 阈值（MB），超过走 `video_url` 直链由 FlowBot 下载 |
 | `flowbot_video_use_direct_url` | bool | `true` | 与图片相反：视频默认走直链（大、更稳），失败回退 base64 |
+| `flowbot_text_split_enabled` | bool | `true` | 正文中的空行（`\n\n`）视为多条消息分隔符，拆成多次微信消息依次发送（@/引用仅挂第一条）|
 
 ## 入站媒体与引用回复（需 FlowBot ≥ 1.5.x 契约，开关默认关）
 
@@ -82,8 +83,14 @@ avatar = await platform.get_member_avatar_url(groups[0].group_id, "wxid_xxx")
 - 头像：入站推送 `avatar_url` 随 `raw_message` 透传；`get_group_avatar` / `get_member_avatar_url` 查询群/成员头像
 - 文件发送：flowbot Linux 容器不支持，`File` 组件记 warning 降级日志
 
-## 图片发送策略
+## 分段发送
 
+- 正文中的空行（两个及以上换行 `\n\n`）视为多条消息分隔符，拆成多次微信消息依次发送；单个换行保留为段内换行
+- `at_users` 与引用（`reply_to`）仅挂在第一条分段上，后续分段为纯文本
+- 兜底 outputpro 等分段插件（其 `SplitStep` 平台白名单不含本适配器，不会对 FlowBot 平台拆分）；若上游已拆段发送，到适配器的每条消息天然无空行，本逻辑不会重复触发
+- 开关 `flowbot_text_split_enabled`（默认开）
+
+## 图片发送策略
 - 本机文件存在 → `image_base64`（读文件）+ `image_path`（同主机兼容）
 - `base64://` / `data:` / **裸 base64** URI 源（如 T2I output_pro 产物）→ 直接提取 base64 串进 `image_base64`，不落盘不二次下载
 - `file:///` 形态 → 剥前缀后按本地文件处理
