@@ -53,6 +53,7 @@ from astrbot.api.platform import (
 )
 from astrbot.api.star import Context, Star
 from astrbot.core.platform.register import register_platform_adapter
+from astrbot.core.utils.astrbot_path import get_astrbot_data_path
 
 _MAX_RECONNECT = 60
 _DEFAULT_RECONNECT = 5
@@ -178,6 +179,8 @@ class FlowBotPlatform(Platform):
         self._stop_event = asyncio.Event()
         self._ws_task: asyncio.Task | None = None
         self._http: aiohttp.ClientSession | None = None
+        # 机器人真实 wxid：启动时经 /api/v1/bot/self 预热 + 推送学习，落盘跨重启
+        self._bot_wxid = self._load_bot_wxid_cache()
 
         self._seen_ids: dict[str, float] = {}
         self._recent_sends: deque[tuple[str, str, float]] = deque(maxlen=50)
@@ -348,6 +351,11 @@ class FlowBotPlatform(Platform):
 
     async def run(self):
         self._stop_event.clear()
+        # 预热先于 WS：保证 wxid 缓存在首条事件到达前就绪
+        try:
+            await self._fetch_bot_wxid()
+        except Exception as e:
+            logger.info(f"FlowBot wxid 预热不可用，回退推送学习: {e}")
         self._ws_task = asyncio.create_task(self._run_ws_loop())
         try:
             await self._ws_task
@@ -494,8 +502,15 @@ class FlowBotPlatform(Platform):
             for k in expired:
                 self._seen_ids.pop(k, None)
 
-        # 过滤自己发送的消息（发送回显 ping-pong）
-        if self._is_recent_send(session_id, data.get("content", "")):
+        # 过滤自己发送的消息（发送回显 ping-pong）：优先确定性判定
+        # sender_id == self_id；仅当身份不可知（旧版服务端无 self_id）时
+        # 才回退内容匹配，避免真人 3 秒内复读机器人被误丢
+        self._remember_bot_wxid(str(data.get("self_id") or ""))
+        sender_id = str(data.get("sender_id") or "")
+        if self._bot_wxid:
+            if sender_id == self._bot_wxid:
+                return
+        elif self._is_recent_send(session_id, data.get("content", "")):
             return
 
         self._cache_session(session_id, data)
@@ -518,6 +533,63 @@ class FlowBotPlatform(Platform):
 
     def _mark_sent(self, session_id: str, content: str):
         self._recent_sends.append((session_id, content, time.time()))
+
+    # ── 机器人身份（真实 wxid）：预热 / 学习 / 持久化 ──────────────────
+
+    def _bot_wxid_cache_path(self) -> str:
+        try:
+            return os.path.join(get_astrbot_data_path(), "flowbot_adapter_bot_wxid")
+        except Exception:
+            return ""
+
+    def _load_bot_wxid_cache(self) -> str:
+        path = self._bot_wxid_cache_path()
+        if not path:
+            return ""
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                return f.read().strip()
+        except OSError:
+            return ""
+
+    def _remember_bot_wxid(self, wxid: str):
+        wxid = str(wxid or "").strip()
+        if not wxid or wxid == self._bot_wxid:
+            return
+        self._bot_wxid = wxid
+        path = self._bot_wxid_cache_path()
+        if path:
+            try:
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write(wxid)
+            except OSError:
+                pass
+        logger.info(f"FlowBot 机器人 wxid 已缓存: {wxid}")
+
+    async def _fetch_bot_wxid(self):
+        """启动预热：GET /api/v1/bot/self 取登录 wxid（Bot Token 鉴权）。
+        source=config 为权威值，learned 为服务端身份库学习值兜底；
+        失败（旧版服务端无此路由/网络未就绪）属预期回退，只记 INFO。"""
+        try:
+            http = await self._ensure_http()
+            async with http.get(f"{self._webui_base}/api/v1/bot/self") as resp:
+                if resp.status != 200:
+                    logger.info(
+                        f"FlowBot wxid 预热不可用（HTTP {resp.status}），回退推送学习"
+                    )
+                    return
+                data = await _parse_json(await resp.text())
+        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+            logger.info(f"FlowBot wxid 预热不可用，回退推送学习: {e}")
+            return
+        if not isinstance(data, dict) or not data.get("ok"):
+            logger.info("FlowBot wxid 预热不可用（响应异常），回退推送学习")
+            return
+        if str(data.get("source") or "") not in ("config", "learned"):
+            return
+        wxid = str(data.get("self_id") or "").strip()
+        if wxid:
+            self._remember_bot_wxid(wxid)
 
     # ── 消息转换 ───────────────────────────────────────────────────────
 
@@ -1050,8 +1122,12 @@ class FlowBotPlatform(Platform):
         return True
 
     async def get_self_id(self) -> str:
-        """返回平台级机器人标识（meta().id）。真实 wxid 由入站消息 self_id 提供。"""
-        return str(self.config.get("id", "flowbot_adapter"))
+        """机器人身份：真实登录 wxid（启动预热/推送学习），未学到时回退 meta id。"""
+        return self._bot_wxid or str(self.config.get("id", "flowbot_adapter"))
+
+    def get_bot_wxid(self) -> str:
+        """真实登录 wxid（能力钩子，供第三方插件在非事件上下文查询；空=尚未学到）。"""
+        return self._bot_wxid
 
     async def _send_to_session(self, session_id: str, message_chain: MessageChain):
         text_parts: list[str] = []

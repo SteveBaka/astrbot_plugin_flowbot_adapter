@@ -57,7 +57,7 @@ FlowBot 平台适配器：通过 **FlowBot Docker WebUI 统一端口**连接微�
 | 群查询 | `get_group_list()` / `get_group_info(group_id)` / `get_group_avatar(group_id)` |
 | 成员查询 | `get_member_list(group_id)` / `get_member_info(group_id, user_id)` / `get_member_avatar_url(group_id, user_id)` |
 | 发送 | `send_text(session_id, content, at_users=None, reply_to=None)` / `send_image(session_id, image)` / `send_message_chain(session_id, chain)` |
-| 标准 | `send_by_session` / `send_proactive_by_session` / `get_client` / `get_self_id` |
+| 标准 | `send_by_session` / `send_proactive_by_session` / `get_client` / `get_self_id` / `get_bot_wxid()` |
 | 能力 | `capabilities()` |
 
 示例：
@@ -89,6 +89,13 @@ avatar = await platform.get_member_avatar_url(groups[0].group_id, "wxid_xxx")
 - `at_users` 与引用（`reply_to`）仅挂在第一条分段上，后续分段为纯文本
 - 兜底 outputpro 等分段插件（其 `SplitStep` 平台白名单不含本适配器，不会对 FlowBot 平台拆分）；若上游已拆段发送，到适配器的每条消息天然无空行，本逻辑不会重复触发
 - 开关 `flowbot_text_split_enabled`（默认开）
+
+## 机器人身份（self_id 链路）
+
+- 适配器维护机器人真实 wxid：启动时从 FlowBot `GET /api/v1/bot/self`（Bot Token 鉴权，`source=config` 权威 / `learned` 服务端学习兜底）预热，运行期从每条推送的 `self_id` 学习，落盘 `<AstrBot data>/flowbot_adapter_bot_wxid` 跨重启生效；预热失败自动回退推送学习（INFO，不报错）
+- 每条入站事件 `abm.self_id` 均为真实 wxid → `event.get_self_id()` 全链路正确（@ 唤醒、引用 is_self 唤醒、记忆/分析类插件的身份判定都依赖它）
+- `get_bot_wxid()`：能力钩子，供插件在非事件上下文（定时任务/proactive/Web）查询真实 wxid；`get_self_id()` 未学到 wxid 时回退 meta id
+- 自发消息（回显）过滤：`sender_id == self_id` 确定性丢弃（覆盖图片/视频等一切回显）；仅当旧版 FlowBot 不带 `self_id` 时才回退 3 秒内容匹配，真人复读不再被误丢
 
 ## 图片发送策略
 - 本机文件存在 → `image_base64`（读文件）+ `image_path`（同主机兼容）
