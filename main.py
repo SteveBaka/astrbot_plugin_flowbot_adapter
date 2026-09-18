@@ -82,6 +82,7 @@ _MEMBERS_TTL = 60  # 群成员缓存 TTL（秒）
 @register_platform_adapter(
     "flowbot_adapter",
     "FlowBot 平台适配器（基于 FlowBot Docker WebUI 统一端口 7300，WS 入站 + HTTP 出站）",
+    logo_path="logo.png",
     default_config_tmpl={
         "flowbot_host": "",
         "flowbot_port": 7400,
@@ -377,7 +378,11 @@ class FlowBotPlatform(Platform):
         logger.info("FlowBot adapter 已终止")
 
     def get_stats(self) -> dict:
-        return dict(self._stats)
+        """基类契约字段（id/status/started_at/error_count/meta 等）必须保留：
+        Dashboard 依此判定平台运行状态，整体覆盖会导致状态显示为「未知」。"""
+        stats = super().get_stats()
+        stats.update(self._stats)
+        return stats
 
     # ── HTTP 客户端 ───────────────────────────────────────────────────
 

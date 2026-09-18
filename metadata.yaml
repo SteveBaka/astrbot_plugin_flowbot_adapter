@@ -1,6 +1,6 @@
 name: astrbot_plugin_flowbot_adapter
 display_name: FlowBot 适配器
 desc: 通过 FlowBot ，让你的 Bot 也能够 WeChat。
-version: v1.4.2
+version: v1.4.3
 author: unsuited_
 repo: https://github.com/SteveBaka/astrbot_plugin_flowbot_adapter

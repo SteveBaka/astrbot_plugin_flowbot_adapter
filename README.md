@@ -97,6 +97,11 @@ avatar = await platform.get_member_avatar_url(groups[0].group_id, "wxid_xxx")
 - `get_bot_wxid()`：能力钩子，供插件在非事件上下文（定时任务/proactive/Web）查询真实 wxid；`get_self_id()` 未学到 wxid 时回退 meta id
 - 自发消息（回显）过滤：`sender_id == self_id` 确定性丢弃（覆盖图片/视频等一切回显）；仅当旧版 FlowBot 不带 `self_id` 时才回退 3 秒内容匹配，真人复读不再被误丢
 
+## 平台状态与 Logo
+
+- **运行状态**：`get_stats()` 先取 AstrBot `Platform` 基类契约字段（`id` / `status` / `started_at` / `error_count` / `meta` 等），再合并本适配器自身的 `recv` / `sent` 计数。Dashboard 的 Bot 卡片按平台 `id` 去匹配该返回值并读取 `status`，因此**不能整体覆盖**——覆盖会让字段缺失，状态恒显示「未知」（灰点），即使连接与收发完全正常。状态值由核心维护，平台任务启动即置 `running`。
+- **Logo**：`@register_platform_adapter(..., logo_path="logo.png")` 指向插件目录下的 `logo.png`，核心（`config_service.register_platform_logo`）把它注册为 `logo_token`，Bot 列表卡片与平台配置页即显示该图标。注册结果写进 `config_template["flowbot_adapter"]`，按适配器独立存放，不共享也不会影响其他适配器。
+
 ## 图片发送策略
 - 本机文件存在 → `image_base64`（读文件）+ `image_path`（同主机兼容）
 - `base64://` / `data:` / **裸 base64** URI 源（如 T2I output_pro 产物）→ 直接提取 base64 串进 `image_base64`，不落盘不二次下载
