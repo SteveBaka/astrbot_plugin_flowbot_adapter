@@ -50,9 +50,9 @@ from astrbot.api.platform import (
     MessageType,
     Platform,
     PlatformMetadata,
+    register_platform_adapter,
 )
 from astrbot.api.star import Context, Star
-from astrbot.core.platform.register import register_platform_adapter
 from astrbot.core.utils.astrbot_path import get_astrbot_data_path
 
 _MAX_RECONNECT = 60
@@ -72,17 +72,19 @@ _VIDEO_TEMP_TTL = 1800
 _MAX_VOICE_DOWNLOAD_BYTES = 10 * 1024 * 1024
 _VOICE_DOWNLOAD_TIMEOUT = 60
 _BARE_B64_MIN_LEN = 64  # 裸 base64 识别的最小长度阈值，避免误伤短路径/URL
-_B64_CHARSET = set(
-    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/="
-)
+_B64_CHARSET = set("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=")
 _SESSIONS_TTL = 60  # 群列表缓存 TTL（秒）
 _MEMBERS_TTL = 60  # 群成员缓存 TTL（秒）
+
+
+# logo 绝对路径：相对 "logo.png" 依赖核心 cwd 解析，安装/重启后易失效导致 Bot 卡片无图标
+_LOGO_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logo.png")
 
 
 @register_platform_adapter(
     "flowbot_adapter",
     "FlowBot 平台适配器（基于 FlowBot Docker WebUI 统一端口 7300，WS 入站 + HTTP 出站）",
-    logo_path="logo.png",
+    logo_path=_LOGO_PATH,
     default_config_tmpl={
         "flowbot_host": "",
         "flowbot_port": 7400,
@@ -94,6 +96,9 @@ _MEMBERS_TTL = 60  # 群成员缓存 TTL（秒）
         "flowbot_video_size_threshold": 14,
         "flowbot_video_use_direct_url": True,
         "flowbot_text_split_enabled": True,
+        "flowbot_forward_attach_media": False,
+        "flowbot_forward_media_limit": 5,
+        "flowbot_forward_media_timeout": 20,
     },
     config_metadata={
         "flowbot_host": {
@@ -146,6 +151,21 @@ _MEMBERS_TTL = 60  # 群成员缓存 TTL（秒）
             "description": "空行分段发送",
             "type": "bool",
             "hint": "把正文中的空行（两个及以上换行）视为多条消息分隔符，拆成多次微信消息依次发送（@ 与引用仅挂在第一条）。兼容 outputpro 等分段插件不支持的平台的兜底；默认开",
+        },
+        "flowbot_forward_attach_media": {
+            "description": "合并转发挂载媒体",
+            "type": "bool",
+            "hint": "开启后把转发条目内可下载的图/表情/视频/语音挂进消息组件（media_url token 直链）。默认关：分析主路径用渲染文本；多模态需要时再开",
+        },
+        "flowbot_forward_media_limit": {
+            "description": "单事件媒体挂载上限",
+            "type": "int",
+            "hint": "合并转发内最多下载/挂载几个媒体组件，防止长转发拖慢响应。默认 5",
+        },
+        "flowbot_forward_media_timeout": {
+            "description": "单媒体下载超时（秒）",
+            "type": "int",
+            "hint": "转发条目 media_url 下载超时；token TTL 1h，建议收到即下。默认 20",
         },
     },
 )
@@ -321,7 +341,9 @@ class FlowBotPlatform(Platform):
                 return str(item.get("avatarUrl") or "") or None
         return None
 
-    async def get_member_info(self, group_id: str, user_id: str) -> MessageMember | None:
+    async def get_member_info(
+        self, group_id: str, user_id: str
+    ) -> MessageMember | None:
         """查询单个群成员信息（从成员列表缓存中匹配）。"""
         members = await self.get_member_list(group_id)
         for m in members:
@@ -332,11 +354,13 @@ class FlowBotPlatform(Platform):
     # ── 基础 ──────────────────────────────────────────────────────────
 
     def meta(self) -> PlatformMetadata:
+        # logo_path 必须进 meta：Bot 卡片/平台页从此读取图标；缺省会回落成字母占位
         return PlatformMetadata(
             name="flowbot_adapter",
             description="FlowBot 平台适配器（FlowBot Docker WebUI 通道）",
             id=self.config.get("id", "flowbot_adapter"),
             adapter_display_name="FlowBot",
+            logo_path=_LOGO_PATH,
             support_streaming_message=False,
             support_proactive_message=True,
         )
@@ -542,17 +566,51 @@ class FlowBotPlatform(Platform):
     # ── 机器人身份（真实 wxid）：预热 / 学习 / 持久化 ──────────────────
 
     def _bot_wxid_cache_path(self) -> str:
+        """持久化到插件数据目录 data/plugin_data/astrbot_plugin_flowbot_adapter/。
+
+        不可写 AstrBot data 根目录（上架安全审查：跨重启数据须落在 plugin_data）。
+        Platform 实例由核心创建，StarTools.get_data_dir() 依赖 Star 调用栈（FIX-27），
+        故这里按审查要求的规范路径拼接。
+        """
         try:
-            return os.path.join(get_astrbot_data_path(), "flowbot_adapter_bot_wxid")
+            base = os.path.join(
+                get_astrbot_data_path(),
+                "plugin_data",
+                "astrbot_plugin_flowbot_adapter",
+            )
+            os.makedirs(base, exist_ok=True)
+            return os.path.join(base, "flowbot_adapter_bot_wxid")
         except Exception:
             return ""
 
+    def _migrate_bot_wxid_cache(self, path: str) -> None:
+        """把 v1.4.2–v1.5.3 遗留在 data 根目录的缓存迁到 plugin_data。"""
+        if not path:
+            return
+        try:
+            legacy = os.path.join(get_astrbot_data_path(), "flowbot_adapter_bot_wxid")
+            if legacy != path and os.path.isfile(legacy) and not os.path.isfile(path):
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                with open(legacy, encoding="utf-8") as f:
+                    data = f.read().strip()
+                if data:
+                    with open(path, "w", encoding="utf-8") as f:
+                        f.write(data)
+                    logger.info(f"FlowBot wxid 缓存已迁移到 plugin_data: {path}")
+                try:
+                    os.remove(legacy)
+                except OSError:
+                    pass
+        except Exception:
+            pass
+
     def _load_bot_wxid_cache(self) -> str:
         path = self._bot_wxid_cache_path()
+        self._migrate_bot_wxid_cache(path)
         if not path:
             return ""
         try:
-            with open(path, "r", encoding="utf-8") as f:
+            with open(path, encoding="utf-8") as f:
                 return f.read().strip()
         except OSError:
             return ""
@@ -659,7 +717,20 @@ class FlowBotPlatform(Platform):
             components.append(
                 Image(file=local, url=emoji_url) if local else Plain(text=text)
             )
+        elif mtype == "forward":
+            # 合并转发：message_str 必须是渲染全文（LLM/分析主入口）
+            rendered = str(
+                data.get("forward_text") or data.get("content") or ""
+            ).strip()
+            if rendered:
+                abm.message_str = rendered
+            components.extend(await self._normalize_inbound_forward(data, text))
         else:
+            if text.startswith("[转发的聊天记录]"):
+                logger.warning(
+                    f"FlowBot 转发文本走了 else 分支（type={mtype!r}），"
+                    f"forward 分支未命中；keys={sorted(data.keys())[:24]}"
+                )
             components.append(Plain(text=text))
 
         # @ 唤醒：群里 @ 到机器人（flowbot 从消息 XML atuserlist 提取 at_users），
@@ -703,6 +774,200 @@ class FlowBotPlatform(Platform):
                 logger.warning(f"FlowBot Reply 组件构造失败，降级为无引用文本: {e}")
         abm.message = components
         return abm
+
+    async def _normalize_inbound_forward(self, data: dict, text: str) -> list:
+        """入站合并转发：渲染全文 → Plain；可选挂载 media_* 媒体组件。
+
+        契约：ADAPTER-HANDOFF-20260922 §三/§四/§五。降级永不丢文本行；
+        不在 Python 端重写 recorditem XML。
+        """
+        title = str(data.get("forward_title") or "").strip()
+        items = data.get("forward_items") or []
+        truncated = bool(data.get("forward_truncated"))
+        rendered = str(data.get("forward_text") or data.get("content") or "").strip()
+        if not rendered:
+            rendered = self._render_forward_items(title, items)
+            if truncated:
+                rendered += "\n…（已截断）"
+        if not rendered:
+            rendered = (
+                f"[转发的聊天记录] {title}".strip() if title else "[转发的聊天记录]"
+            )
+
+        comps: list = [Plain(text=rendered)]
+        attach_on = bool(self.config.get("flowbot_forward_attach_media", False))
+        # 诊断：无论 items 是否为空都打点，避免「无 forward_items」时静默
+        logger.info(
+            f"FlowBot forward: title={title!r} items={len(items) if isinstance(items, list) else 0} "
+            f"has_items_key={'forward_items' in data} has_media_keys="
+            f"{any(k.startswith('media_') for it in (items or []) if isinstance(it, dict) for k in it)} "
+            f"attach_media={attach_on} truncated={truncated} data_keys={sorted(data.keys())[:24]}"
+        )
+        if attach_on and items:
+            media_comps = await self._download_forward_media(items)
+            if media_comps:
+                logger.info(
+                    f"FlowBot forward media attached: {len(media_comps)} "
+                    f"({', '.join(type(c).__name__ for c in media_comps)})"
+                )
+            else:
+                logger.info(
+                    "FlowBot forward media attached: 0 (无可下载媒体或全部降级)"
+                )
+            comps.extend(media_comps)
+        return comps
+
+    def _render_forward_items(self, title: str, items: list) -> str:
+        """结构化 items → 文本兜底（正常路径由 FlowBot 提供 forward_text）。"""
+        lines = [f"[转发的聊天记录]{title}" if title else "[转发的聊天记录]"]
+
+        def walk(nodes: list, depth: int = 0) -> None:
+            indent = "  " * min(depth, 8)
+            for it in nodes:
+                if not isinstance(it, dict):
+                    continue
+                name = str(it.get("sourcename") or "")
+                desc = str(it.get("datadesc") or it.get("datatitle") or "")
+                dt = it.get("datatype")
+                if dt == 17 or it.get("chat_record_items"):
+                    nested_t = str(it.get("chat_record_title") or "聊天记录")
+                    head = (
+                        f"{indent}{name}: [转发的聊天记录]{nested_t}"
+                        if name
+                        else f"{indent}[转发的聊天记录]{nested_t}"
+                    )
+                    lines.append(head)
+                    walk(it.get("chat_record_items") or [], depth + 1)
+                    continue
+                if dt in (2, 3):
+                    placeholder = "[图片]"
+                elif dt == 34:
+                    dur = it.get("media_duration_sec")
+                    placeholder = (
+                        f"[语音消息] ({dur}s)"
+                        if isinstance(dur, (int, float))
+                        else "[语音消息]"
+                    )
+                elif dt == 43:
+                    placeholder = "[视频]"
+                elif dt in (37, 47):
+                    placeholder = "[表情包]"
+                elif dt in (8, 49):
+                    placeholder = f"[文件] {desc}".strip() if desc else "[文件]"
+                else:
+                    placeholder = desc or "[消息]"
+                line = (
+                    f"{indent}{name}: {placeholder}"
+                    if name
+                    else f"{indent}{placeholder}"
+                )
+                lines.append(line)
+
+        walk(items if isinstance(items, list) else [])
+        return "\n".join(lines)
+
+    async def _download_forward_media(self, items: list) -> list:
+        """按 media_* 挂载图/表情/视频/语音（file 不挂）。失败只占位，不抛。"""
+        limit = self._config_int("flowbot_forward_media_limit", 5)
+        timeout = max(1, self._config_int("flowbot_forward_media_timeout", 20))
+        out: list = []
+        if limit <= 0:
+            return out
+
+        async def walk(nodes: list) -> None:
+            for it in nodes:
+                if len(out) >= limit:
+                    return
+                if not isinstance(it, dict):
+                    continue
+                nested = it.get("chat_record_items")
+                if isinstance(nested, list) and nested:
+                    await walk(nested)
+                    if len(out) >= limit:
+                        return
+                kind = str(it.get("media_kind") or "").strip().lower()
+                if kind not in ("image", "video", "voice", "emoji"):
+                    continue
+                if it.get("media_available") is False:
+                    # PR#52 错误分流：
+                    # thumb_only → 可挂缩略；skipped/not_recoverable/no_source 等不硬下
+                    err = str(it.get("media_error") or "").strip()
+                    thumb = str(it.get("media_thumb_url") or "").strip()
+                    logger.debug(
+                        f"FlowBot forward item degraded: kind={kind} "
+                        f"err={err!r} thumb={'yes' if thumb else 'no'}"
+                    )
+                    if err in ("skipped", "not_recoverable"):
+                        continue
+                    if kind in ("image", "video", "emoji") and thumb:
+                        path = await self._download_image(
+                            self._fix_image_url(thumb), timeout=timeout
+                        )
+                        if path:
+                            out.append(Image(file=path, url=thumb))
+                            self._track_temp_file(path)
+                            logger.info(f"FlowBot forward thumb attached: {kind}")
+                    continue
+                url = str(it.get("media_url") or "").strip()
+                if not url:
+                    # url_rejected / cdn_unavailable / no_source 等：无主媒体直链
+                    logger.debug(
+                        f"FlowBot forward item skip: kind={kind} "
+                        f"err={it.get('media_error')!r} no media_url"
+                    )
+                    thumb = str(it.get("media_thumb_url") or "").strip()
+                    if thumb and kind in ("image", "video", "emoji"):
+                        path = await self._download_image(
+                            self._fix_image_url(thumb), timeout=timeout
+                        )
+                        if path:
+                            out.append(Image(file=path, url=thumb))
+                            self._track_temp_file(path)
+                            logger.info(f"FlowBot forward thumb attached: {kind}")
+                    continue
+                url = self._fix_image_url(url) if url.startswith("http") else url
+                try:
+                    if kind in ("image", "emoji"):
+                        path = await self._download_image(url, timeout=timeout)
+                        if path:
+                            out.append(
+                                Image(file=path, url=str(it.get("media_url") or ""))
+                            )
+                            self._track_temp_file(path)
+                            logger.info(f"FlowBot forward media ok: {kind}")
+                    elif kind == "video":
+                        path = await self._download_video(url)
+                        if path:
+                            comp = Video(file=path)
+                            self._track_temp_file(path)
+                            thumb = str(it.get("media_thumb_url") or "").strip()
+                            if thumb:
+                                poster = await self._download_image(
+                                    self._fix_image_url(thumb), timeout=timeout
+                                )
+                                if poster:
+                                    try:
+                                        comp.cover = poster
+                                        self._track_temp_file(poster)
+                                    except Exception:
+                                        pass
+                            out.append(comp)
+                            logger.info("FlowBot forward media ok: video")
+                    elif kind == "voice":
+                        path = await self._download_voice(url)
+                        if path:
+                            try:
+                                out.append(Record(file=path))
+                                self._track_temp_file(path)
+                                logger.info("FlowBot forward media ok: voice")
+                            except Exception as e:
+                                logger.warning(f"FlowBot 转发语音组件构造失败: {e}")
+                                self._track_temp_file(path)
+                except Exception as e:
+                    logger.debug(f"FlowBot 转发媒体挂载失败: {e}")
+
+        await walk(items if isinstance(items, list) else [])
+        return out
 
     async def _normalize_inbound_image(self, data: dict, text: str):
         """入站图片源归一化：base64://、data:、裸 base64、http(s)、本地路径。"""
@@ -796,9 +1061,7 @@ class FlowBotPlatform(Platform):
             async with aiohttp.ClientSession(timeout=timeout) as sess:
                 async with sess.get(url) as resp:
                     if resp.status != 200:
-                        logger.warning(
-                            f"视频下载失败 {resp.status}: {url[:120]}"
-                        )
+                        logger.warning(f"视频下载失败 {resp.status}: {url[:120]}")
                         os.close(fd)
                         os.remove(path)
                         return None
@@ -943,9 +1206,9 @@ class FlowBotPlatform(Platform):
             session_id=message.session_id,
             platform=self,
         )
-        # 入站：将本适配器下载的临时图片/语音登记到事件周期，事件结束后由 AstrBot 清理
+        # 入站：将本适配器下载的临时图片/语音/视频登记到事件周期，事件结束后由 AstrBot 清理
         for comp in message.message or []:
-            if isinstance(comp, (Image, Record)):
+            if isinstance(comp, (Image, Record, Video)):
                 file_ref = getattr(comp, "file", None)
                 if file_ref and file_ref in self._temp_files:
                     try:
@@ -967,15 +1230,17 @@ class FlowBotPlatform(Platform):
             pass
         return url
 
-    async def _download_image(self, url: str) -> str | None:
-        """下载图片到临时文件，返回本地路径。超时 15s，大小上限 20MB。
+    async def _download_image(
+        self, url: str, timeout_sec: int | None = None
+    ) -> str | None:
+        """下载图片到临时文件，返回本地路径。超时默认 15s，大小上限 5MB。
 
         使用独立的无鉴权 session，避免把 FlowBot API Key 随下载请求泄露给第三方 URL。
         """
         if not url:
             return None
         try:
-            timeout = aiohttp.ClientTimeout(total=15)
+            timeout = aiohttp.ClientTimeout(total=timeout_sec or 15)
             async with aiohttp.ClientSession(timeout=timeout) as sess:
                 async with sess.get(url) as resp:
                     if resp.status != 200:
@@ -1073,6 +1338,8 @@ class FlowBotPlatform(Platform):
             "supports_group": True,
             "supports_proactive": True,
             "supports_avatar": True,  # 群/成员头像（sessions/group-members enrich）
+            "supports_forward_inbound": True,
+            "supports_forward_outbound": False,
             "max_text_length": 1800,
             "image_max_bytes": 5 * 1024 * 1024,
         }
@@ -1101,18 +1368,14 @@ class FlowBotPlatform(Platform):
             return True
         return False
 
-    async def send_image(
-        self, session_id: str, image: Image | str
-    ) -> bool:
+    async def send_image(self, session_id: str, image: Image | str) -> bool:
         """便捷图片发送（第三方插件调用）。image 可为 Image 组件或路径/URL/base64 字符串。"""
         if isinstance(image, str):
             image = Image(file=image)
         await self._send_image(session_id, image, None)
         return True
 
-    async def send_video(
-        self, session_id: str, video: Video | str
-    ) -> bool:
+    async def send_video(self, session_id: str, video: Video | str) -> bool:
         """便捷视频发送（第三方插件调用）。video 可为 Video 组件或路径/URL/base64 字符串。"""
         if isinstance(video, str):
             video = Video(file=video)
@@ -1385,7 +1648,7 @@ class FlowBotPlatform(Platform):
         if not candidate:
             return ""
         if candidate.startswith("base64://"):
-            return candidate[len("base64://"):].strip()
+            return candidate[len("base64://") :].strip()
         if candidate.startswith("data:") and "," in candidate:
             return candidate.split(",", 1)[-1].strip()
         if _looks_like_base64(candidate):
@@ -1408,6 +1671,7 @@ class FlowBotPlatform(Platform):
         """发送视频/文件组件：本地文件走 upload token，直链走 video_url，
         base64 源 ≤ 阈值内联；失败仅告警，不炸消息循环。"""
         try:
+
             def _pick(candidates):
                 for c in candidates:
                     if c:
@@ -1416,7 +1680,7 @@ class FlowBotPlatform(Platform):
 
             def _strip_file_uri(val: str) -> str:
                 if val.startswith("file:///"):
-                    return val[len("file:///"):].strip()
+                    return val[len("file:///") :].strip()
                 return val
 
             comp_file = str(getattr(comp, "file", None) or "").strip()
@@ -1427,11 +1691,12 @@ class FlowBotPlatform(Platform):
             stripped = [_strip_file_uri(v) for v in (comp_file, comp_url, comp_path)]
             _fetch = []
             for s in stripped:
-                if s.startswith("http") or _looks_like_base64(s):
-                    _fetch.append(s)
-                elif s.startswith("base64://") or (s.startswith("data:") and "," in s):
-                    _fetch.append(s)
-                elif s and os.path.isfile(s):
+                if (
+                    s.startswith(("http", "base64://"))
+                    or _looks_like_base64(s)
+                    or (s.startswith("data:") and "," in s)
+                    or (s and os.path.isfile(s))
+                ):
                     _fetch.append(s)
             source = _pick(tuple(_fetch))
             if not source:
@@ -1450,17 +1715,15 @@ class FlowBotPlatform(Platform):
                 threshold_mb = 14
             threshold_bytes = threshold_mb * 1024 * 1024
 
-            is_existing_file = source and not source.startswith("http") and (
-                os.path.isfile(source)
+            is_existing_file = (
+                source and not source.startswith("http") and (os.path.isfile(source))
             )
 
             if is_existing_file:
                 # 本地文件视频：upload token 通道（统一大文件/小文件链路）。
                 # 上传后以 media_path 引用 flowbot 侧落盘产物（/tmp/weflow_uploads/<token><ext>）。
                 try:
-                    up = await self._upload_media(
-                        local_path=source, kind="video"
-                    )
+                    up = await self._upload_media(local_path=source, kind="video")
                 except Exception as e:
                     logger.warning(
                         f"[FlowBot] 视频上传异常 (session={session_id}): {e}"
@@ -1470,7 +1733,8 @@ class FlowBotPlatform(Platform):
                     logger.warning(
                         "[FlowBot] 视频上传失败或无 token，已忽略 "
                         "(session=%s, file=%s)",
-                        session_id, source,
+                        session_id,
+                        source,
                     )
                     return
                 token = str(up.get("token") or "").strip()
@@ -1487,8 +1751,8 @@ class FlowBotPlatform(Platform):
                     media_path = f"/tmp/weflow_uploads/{token}{ext}"
                 else:
                     logger.warning(
-                        "[FlowBot] 视频上传响应无 token/path，已忽略 "
-                        "(session=%s)", session_id,
+                        "[FlowBot] 视频上传响应无 token/path，已忽略 (session=%s)",
+                        session_id,
                     )
                     return
                 payload["media_path"] = media_path
@@ -1504,7 +1768,8 @@ class FlowBotPlatform(Platform):
                     logger.warning(
                         "[FlowBot] 视频发送跳过: base64 源超阈值(%dMB) "
                         "且无 URL/本地文件 (session=%s)",
-                        threshold_mb, session_id,
+                        threshold_mb,
+                        session_id,
                     )
                     return
 
@@ -1512,7 +1777,9 @@ class FlowBotPlatform(Platform):
             self._stats["sent"] += 1
             logger.info(f"FlowBot video -> {session_id}")
         except Exception as e:
-            logger.warning("[FlowBot] 视频发送失败（FlowBot 版本过低或网络异常）: %s", e)
+            logger.warning(
+                "[FlowBot] 视频发送失败（FlowBot 版本过低或网络异常）: %s", e
+            )
 
     async def _upload_media(
         self,
@@ -1544,9 +1811,7 @@ class FlowBotPlatform(Platform):
             async with http.post(url, json=payload) as resp:
                 text = await resp.text()
                 if resp.status >= 400:
-                    logger.warning(
-                        f"FlowBot 媒体上传失败 {resp.status}: {text[:200]}"
-                    )
+                    logger.warning(f"FlowBot 媒体上传失败 {resp.status}: {text[:200]}")
                     return None
                 result = await _parse_json(text)
                 if isinstance(result, dict):
@@ -1669,10 +1934,8 @@ def _wxid_match(a: str, b: str) -> bool:
     """
     na = str(a or "").strip().lower()
     nb = str(b or "").strip().lower()
-    if na.startswith("wxid_"):
-        na = na[len("wxid_"):]
-    if nb.startswith("wxid_"):
-        nb = nb[len("wxid_"):]
+    na = na.removeprefix("wxid_")
+    nb = nb.removeprefix("wxid_")
     return bool(na) and na == nb
 
 

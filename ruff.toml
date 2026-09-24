@@ -1,0 +1,16 @@
+# ruff format 使用默认 88；check 忽略适配器有意为之的防御式风格项。
+# - E501：CJK 配置 hint / 文档串
+# - BLE001 / S110：版本差异防御与不中断消息循环的兜底 except
+# - ASYNC230：同步读小文件可接受（AstrBot 官方说明）
+# - SIM117：保持下载会话嵌套可读性
+line-length = 88
+
+[lint]
+ignore = [
+  "E501",
+  "BLE001",
+  "S110",
+  "ASYNC230",
+  "SIM117",
+  "EXE002",
+]

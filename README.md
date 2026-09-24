@@ -31,6 +31,9 @@ FlowBot 平台适配器：通过 **FlowBot Docker WebUI 统一端口**连接微�
 | `flowbot_video_size_threshold` | int | `14` | 出站视频 base64 阈值（MB），超过走 `video_url` 直链由 FlowBot 下载 |
 | `flowbot_video_use_direct_url` | bool | `true` | 与图片相反：视频默认走直链（大、更稳），失败回退 base64 |
 | `flowbot_text_split_enabled` | bool | `true` | 正文中的空行（`\n\n`）视为多条消息分隔符，拆成多次微信消息依次发送（@/引用仅挂第一条）|
+| `flowbot_forward_attach_media` | bool | `false` | 合并转发条目媒体挂载到组件（`media_url` token/CDN 直链）；分析主路径用渲染文本 |
+| `flowbot_forward_media_limit` | int | `5` | 单事件最多下载/挂载几个媒体 |
+| `flowbot_forward_media_timeout` | int | `20` | 单媒体下载超时（秒） |
 
 ## 入站媒体与引用回复（需 FlowBot ≥ 1.5.x 契约，开关默认关）
 
@@ -75,6 +78,7 @@ avatar = await platform.get_member_avatar_url(groups[0].group_id, "wxid_xxx")
 - 文本、图片收发（消息时间戳透传 flowbot 推送的真实发送时间）
 - 视频收发（出站三通道：本地文件 upload token / 直链 / base64；入站 token 直链下载）
 - 入站语音（`Record` 组件，WAV 由 FlowBot 解码交付；转写/ASR 由 astrbot 配置自理）
+- **入站合并转发**（`type=forward`）：`message_str` 为渲染全文；`raw_message.forward_items` 结构化条目；可选挂载条目媒体（图/表情/视频/语音 token 直链，见下方配置）
 - 引用回复：引用 bot 消息无 @ 直接唤醒，引用内容渲染为 `[Quote(昵称: 原文)]` 进模型上下文
 - 群聊 / 私聊（会话类型判断，群回复目标为群会话）
 - 群 @ 发送（`at_users`，支持 `FlowBotMention(wxid=...)` 自研组件与 AstrBot 内置 `At(qq=...)` 兼容；`"all"` = @全体）
@@ -92,7 +96,7 @@ avatar = await platform.get_member_avatar_url(groups[0].group_id, "wxid_xxx")
 
 ## 机器人身份（self_id 链路）
 
-- 适配器维护机器人真实 wxid：启动时从 FlowBot `GET /api/v1/bot/self`（Bot Token 鉴权，`source=config` 权威 / `learned` 服务端学习兜底）预热，运行期从每条推送的 `self_id` 学习，落盘 `<AstrBot data>/flowbot_adapter_bot_wxid` 跨重启生效；预热失败自动回退推送学习（INFO，不报错）
+- 适配器维护机器人真实 wxid：启动时从 FlowBot `GET /api/v1/bot/self`（Bot Token 鉴权，`source=config` 权威 / `learned` 服务端学习兜底）预热，运行期从每条推送的 `self_id` 学习，落盘 `data/plugin_data/astrbot_plugin_flowbot_adapter/flowbot_adapter_bot_wxid` 跨重启生效（旧路径自动迁移）；预热失败自动回退推送学习（INFO，不报错）
 - 每条入站事件 `abm.self_id` 均为真实 wxid → `event.get_self_id()` 全链路正确（@ 唤醒、引用 is_self 唤醒、记忆/分析类插件的身份判定都依赖它）
 - `get_bot_wxid()`：能力钩子，供插件在非事件上下文（定时任务/proactive/Web）查询真实 wxid；`get_self_id()` 未学到 wxid 时回退 meta id
 - 自发消息（回显）过滤：`sender_id == self_id` 确定性丢弃（覆盖图片/视频等一切回显）；仅当旧版 FlowBot 不带 `self_id` 时才回退 3 秒内容匹配，真人复读不再被误丢
@@ -100,7 +104,7 @@ avatar = await platform.get_member_avatar_url(groups[0].group_id, "wxid_xxx")
 ## 平台状态与 Logo
 
 - **运行状态**：`get_stats()` 先取 AstrBot `Platform` 基类契约字段（`id` / `status` / `started_at` / `error_count` / `meta` 等），再合并本适配器自身的 `recv` / `sent` 计数。Dashboard 的 Bot 卡片按平台 `id` 去匹配该返回值并读取 `status`，因此**不能整体覆盖**——覆盖会让字段缺失，状态恒显示「未知」（灰点），即使连接与收发完全正常。状态值由核心维护，平台任务启动即置 `running`。
-- **Logo**：`@register_platform_adapter(..., logo_path="logo.png")` 指向插件目录下的 `logo.png`，核心（`config_service.register_platform_logo`）把它注册为 `logo_token`，Bot 列表卡片与平台配置页即显示该图标。注册结果写进 `config_template["flowbot_adapter"]`，按适配器独立存放，不共享也不会影响其他适配器。
+- **Logo**：`@register_platform_adapter(..., logo_path=<插件目录绝对路径>/logo.png)`，且 `PlatformMetadata` 同步带 `logo_path`（Bot 列表卡片/平台配置页按 meta 读图；相对路径易因 cwd 解析失败导致回落字母占位）。核心 `config_service.register_platform_logo` 注册为 `logo_token`，写进 `config_template["flowbot_adapter"]`，按适配器独立存放。已验证自定义实例 id（如 `flowbot_23`）与默认 id 均可显示。
 
 ## 图片发送策略
 - 本机文件存在 → `image_base64`（读文件）+ `image_path`（同主机兼容）

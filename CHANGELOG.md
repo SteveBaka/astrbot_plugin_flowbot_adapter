@@ -2,6 +2,45 @@
 
 本插件所有版本更新记录。版本遵循语义化版本（`vMAJOR.MINOR.PATCH`）。
 
+## v1.5.0 — 2026-09-23
+
+> 合并 v1.5.0–v1.5.5 开发迭代为单一发布：入站合并转发全链路、条目媒体挂载、
+> FlowBot PR#52 契约对齐，以及上架合规与 Logo 修复。
+
+### 新增：入站合并转发（type=forward）
+- `convert_message` 新增 `forward` 分支：`message_str` 取 `forward_text`/`content`
+  渲染全文（LLM/分析主入口）；`raw_message.forward_items` 透传结构化条目。
+- `_normalize_inbound_forward`：文本行永不丢；结构缺失时 `_render_forward_items`
+  兜底（datatype 1/2/3/8/17/34/37/43/47/49，嵌套递归缩进）。
+- 诊断：进入 forward 分支输出 `title/items/has_media_keys/attach_media/data_keys`；
+  条目 `ok`/`thumb attached`/`degraded` 分级日志。
+
+### 新增：条目媒体挂载（可选，对齐 FlowBot PR#52）
+- 配置：
+  - `flowbot_forward_attach_media`（默认关）：把 `media_url`（token 直链 1h / emoji CDN）
+    下载后挂 `Image`/`Video`/`Record`；
+  - `flowbot_forward_media_limit`（默认 5）/ `flowbot_forward_media_timeout`（默认 20s）。
+- `media_available=false` 时：`thumb_only` 挂 `media_thumb_url`；
+  `skipped`/`not_recoverable` 只保留文本行；其余错误码有缩略则挂缩略。
+- 下载使用无鉴权独立 session；本地临时文件登记事件周期（Image/Record/Video）。
+- `capabilities()`：`supports_forward_inbound=True`，`supports_forward_outbound=False`。
+- 渲染对齐 datatype=2（相片）/37（動態貼圖）；不在 Python 端解析 recorditem XML。
+
+### 修复：wxid 缓存持久化路径（上架安全审查）
+- 机器人 wxid 缓存由 `<data>/flowbot_adapter_bot_wxid` 改为
+  `data/plugin_data/astrbot_plugin_flowbot_adapter/flowbot_adapter_bot_wxid`。
+- 启动自动迁移旧路径缓存并删除遗留文件（该路径原为 v1.4.2 引入）。
+
+### 修复：Bot 卡片 Logo 不显示
+- `logo_path` 使用插件目录下 `logo.png` 的**绝对路径**（相对路径依赖 cwd 易失效）。
+- `PlatformMetadata` 补传 `logo_path`，Bot 列表卡片与平台配置页按 meta 读图；
+  自定义实例 id（如 `flowbot_23`）与默认 id 均可显示。
+
+### 说明
+- 字段缺失即能力缺失：无 `forward_*` 时行为与 v1.4.3 一致。
+- 平台适配器升级后须**完整重启 AstrBot**（reload 不替换运行中 Platform 实例）。
+- 出站合并转发仍延期；OneBot 通道本插件不涉及。
+
 ## v1.4.3 — 2026-09-18
 
 ### 修复：平台状态显示
@@ -43,7 +82,7 @@
 
 ### 新增：出站文本空行分段
 - `_send_to_session` 将正文中的空行（`\n\n`）视为多条消息分隔符，拆成多次
-  FlowBot 发送依次落为多个微信气泡；`at_users` 与引用仅挂第一条分段。
+  FlowBot 发送依次落为多个微信气泡；`at_users` 与引用仅挂在第一条分段。
 - 背景：outputpro 等分段插件的 `SplitStep` 平台白名单不含本适配器，其分段
   逻辑对 FlowBot 平台直接短路，LLM 多段回复会合并为单条；本逻辑在适配器侧
   兜底拆分。上游已拆段时每条消息无空行，不会重复触发。
